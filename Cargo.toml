@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+
+members = [
+    "crates/cherino",
+    "crates/cherino-macros",
+    "crates/cherino-runtime",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+authors = ["langyo <langyo.china@gmail.com>"]
+repository = "https://github.com/celestia-island/cherino"
+
+[workspace.lints.rust]
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.dev]
+debug = 1
+opt-level = 0
+incremental = true
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = 0
+
+[profile.bench]
+debug = 0

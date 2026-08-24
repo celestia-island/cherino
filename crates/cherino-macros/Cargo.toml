@@ -1,0 +1,23 @@
+[package]
+name = "cherino-macros"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Getters derive macro for the cherino container toolkit."
+license-file = "../../LICENSE"
+keywords = ["derive", "getters", "accessors", "proc-macro"]
+categories = ["development-tools::procedural-macros"]
+publish = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "^1"
+quote = "^1"
+syn = { version = "^2", features = ["full", "parsing", "printing"] }
+
+[lints]
+workspace = true

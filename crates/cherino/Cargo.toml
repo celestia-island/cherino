@@ -1,0 +1,46 @@
+[package]
+name = "cherino"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Runtime-agnostic container operations toolkit with a Docker reference backend and layered security profiles."
+license-file = "../../LICENSE"
+keywords = ["containers", "docker", "sandbox", "oci", "bollard"]
+categories = ["containers", "api-bindings", "asynchronous"]
+publish = true
+
+[features]
+default = ["docker"]
+# Bollard-based Docker Engine reference backend (ContainerManager).
+docker = ["dep:bollard"]
+# CLI-driven adapters for WSL Containers (Windows) and Apple Container (macOS).
+cli-backend = []
+# Integration tests that require a live Docker daemon.
+docker-tests = ["docker"]
+
+[dependencies]
+cherino-macros = { path = "../cherino-macros", version = "0.1.0" }
+anyhow = "^1"
+async-trait = "^0.1"
+bollard = { version = "^0.21", optional = true }
+chrono = { version = "^0.4", features = ["serde", "clock"] }
+futures = "^0.3"
+serde = { version = "^1", features = ["derive"] }
+serde_json = "^1"
+serde_yaml = "^0.9"
+tar = "^0.4"
+tempfile = "^3"
+thiserror = "^2"
+tokio = { version = "^1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "fs", "sync", "signal", "process"] }
+toml = "^1"
+tracing = { version = "^0.1", features = ["log"] }
+uuid = { version = "^1", features = ["v7", "serde"] }
+
+[dev-dependencies]
+tempfile = "^3"
+tokio = { version = "^1", features = ["rt", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,44 @@
+[package]
+name = "cherino-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "OCI-native rootless container runtime backend for cherino, built on libcontainer (Youki)."
+license-file = "../../LICENSE"
+keywords = ["youki", "libcontainer", "oci", "containers", "runtime"]
+categories = ["containers", "os::linux-apis"]
+publish = true
+
+[dependencies]
+cherino = { path = "../cherino", version = "0.1.0", default-features = false }
+async-trait = "^0.1"
+chrono = { version = "^0.4", features = ["serde", "clock"] }
+reqwest = { version = "^0.13", default-features = false, features = [
+    "json",
+    "rustls-no-provider",
+    "stream",
+    "charset",
+    "http2",
+] }
+serde = { version = "^1", features = ["derive"] }
+serde_json = "^1"
+tar = "^0.4"
+tokio = { version = "^1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "fs", "sync", "signal", "process"] }
+tracing = { version = "^0.1", features = ["log"] }
+uuid = { version = "^1", features = ["v7", "serde"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libcontainer = "^0.7"
+libcgroups = "^0.7"
+oci-spec = { version = "^0.10", features = ["runtime"] }
+nix = { version = "^0.29", features = ["process", "signal", "fs"] }
+
+[dev-dependencies]
+anyhow = "^1"
+tempfile = "^3"
+tokio = { version = "^1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

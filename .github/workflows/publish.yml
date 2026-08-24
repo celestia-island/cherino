@@ -1,0 +1,43 @@
+name: Publish crates.io
+
+on:
+  push:
+    tags: [v*]
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: [self-hosted, linux, x64, local]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+        env:
+          GIT_CONFIG_COUNT: "0"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Topological order: cherino-macros -> cherino -> cherino-runtime.
+      - name: Verify workspace
+        run: cargo check --workspace --all-features
+
+      - name: Publish cherino-macros
+        run: cargo publish -p cherino-macros --token ${{ secrets.CRATES_IO_API_TOKEN }}
+
+      - name: Publish cherino
+        run: cargo publish -p cherino --token ${{ secrets.CRATES_IO_API_TOKEN }}
+
+      - name: Publish cherino-runtime
+        run: cargo publish -p cherino-runtime --token ${{ secrets.CRATES_IO_API_TOKEN }}

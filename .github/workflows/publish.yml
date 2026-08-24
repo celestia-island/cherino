@@ -30,14 +30,60 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # Topological order: cherino-macros -> cherino -> cherino-runtime.
+      # Per-crate skip guards make a retried tag run idempotent when an
+      # earlier step already succeeded; the crates.io API requires a
+      # User-Agent header (403 otherwise).
       - name: Verify workspace
         run: cargo check --workspace --all-features
 
       - name: Publish cherino-macros
-        run: cargo publish -p cherino-macros --token ${{ secrets.CRATES_IO_API_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -H "User-Agent: celestia-island" "https://crates.io/api/v1/crates/cherino-macros/${VERSION}" || echo "000")
+          if [ "$STATUS" = "200" ]; then
+            echo "::warning::cherino-macros ${VERSION} already published — skipping."
+          else
+            cargo publish -p cherino-macros --token ${{ secrets.CRATES_IO_API_TOKEN }}
+          fi
+
+      - name: Wait for the crates.io index to see cherino-macros
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          for i in $(seq 1 60); do
+            STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -H "User-Agent: celestia-island" "https://crates.io/api/v1/crates/cherino-macros/${VERSION}" || echo "000")
+            [ "$STATUS" = "200" ] && exit 0
+            sleep 5
+          done
+          echo "::error::cherino-macros ${VERSION} never appeared on crates.io within 5 minutes."
+          exit 1
 
       - name: Publish cherino
-        run: cargo publish -p cherino --token ${{ secrets.CRATES_IO_API_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -H "User-Agent: celestia-island" "https://crates.io/api/v1/crates/cherino/${VERSION}" || echo "000")
+          if [ "$STATUS" = "200" ]; then
+            echo "::warning::cherino ${VERSION} already published — skipping."
+          else
+            cargo publish -p cherino --token ${{ secrets.CRATES_IO_API_TOKEN }}
+          fi
+
+      - name: Wait for the crates.io index to see cherino
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          for i in $(seq 1 60); do
+            STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -H "User-Agent: celestia-island" "https://crates.io/api/v1/crates/cherino/${VERSION}" || echo "000")
+            [ "$STATUS" = "200" ] && exit 0
+            sleep 5
+          done
+          echo "::error::cherino ${VERSION} never appeared on crates.io within 5 minutes."
+          exit 1
 
       - name: Publish cherino-runtime
-        run: cargo publish -p cherino-runtime --token ${{ secrets.CRATES_IO_API_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" -H "User-Agent: celestia-island" "https://crates.io/api/v1/crates/cherino-runtime/${VERSION}" || echo "000")
+          if [ "$STATUS" = "200" ]; then
+            echo "::warning::cherino-runtime ${VERSION} already published — skipping."
+          else
+            cargo publish -p cherino-runtime --token ${{ secrets.CRATES_IO_API_TOKEN }}
+          fi

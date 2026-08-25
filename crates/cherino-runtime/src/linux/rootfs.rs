@@ -587,22 +587,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn host_rootfs_opt_in_flag_is_fail_closed_by_default() {
-        let _guard = EnvGuard::clear();
-        assert!(!host_rootfs_allowed(), "default must be fail-closed");
-        unsafe { std::env::set_var(HOST_ROOTFS_ALLOW_ENV, "1") };
-        assert!(host_rootfs_allowed(), "=1 must enable the escape hatch");
-        unsafe { std::env::set_var(HOST_ROOTFS_ALLOW_ENV, "true") };
-        assert!(host_rootfs_allowed(), "=true must enable the escape hatch");
-        unsafe { std::env::set_var(HOST_ROOTFS_ALLOW_ENV, "0") };
-        assert!(!host_rootfs_allowed(), "=0 must stay disabled");
-        unsafe { std::env::set_var(HOST_ROOTFS_ALLOW_ENV, "no") };
-        assert!(!host_rootfs_allowed(), "garbage must stay disabled");
-    }
-
+    /// Both checks mutate the same process-wide environment variable, so they
+    /// run sequentially inside one test to avoid racing each other under the
+    /// default parallel test harness.
     #[tokio::test]
-    async fn host_rootfs_overlay_fails_closed_by_default() {
+    async fn host_rootfs_flag_and_overlay_fail_closed_by_default() {
+        {
+            let _guard = EnvGuard::clear();
+            assert!(!host_rootfs_allowed(), "default must be fail-closed");
+            unsafe { std::env::set_var(HOST_ROOTFS_ALLOW_ENV, "1") };
+            assert!(host_rootfs_allowed(), "=1 must enable the escape hatch");
+            unsafe { std::env::set_var(HOST_ROOTFS_ALLOW_ENV, "true") };
+            assert!(host_rootfs_allowed(), "=true must enable the escape hatch");
+            unsafe { std::env::set_var(HOST_ROOTFS_ALLOW_ENV, "0") };
+            assert!(!host_rootfs_allowed(), "=0 must stay disabled");
+            unsafe { std::env::set_var(HOST_ROOTFS_ALLOW_ENV, "no") };
+            assert!(!host_rootfs_allowed(), "garbage must stay disabled");
+        }
+
         let _guard = EnvGuard::clear();
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = RootfsManager::new(tmp.path());

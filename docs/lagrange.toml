@@ -1,0 +1,8 @@
+[site]
+title = "Cherino"
+description = "Unified, runtime-agnostic container operations toolkit for the celestia platform: one ContainerOps trait, a Docker reference backend, a rootless OCI backend, and a shared security-profile layer."
+
+cname = "cherino.docs.celestia.world"
+[languages]
+default = "en"
+order = ["en", "zhs", "zht", "ja", "ko", "fr", "es", "ru", "ar"]

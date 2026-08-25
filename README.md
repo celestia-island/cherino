@@ -1,8 +1,36 @@
-# cherino
+<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
 
-Container operations toolkit for the celestia platform — a standalone
-[Rust](https://www.rust-lang.org/) library providing a unified, runtime-agnostic
-API for creating and managing sandboxed containers.
+<h1 align="center">Cherino</h1>
+
+<p align="center"><strong>Unified, runtime-agnostic container operations toolkit for the celestia platform</strong></p>
+
+<div align="center">
+
+[![License: SySL-1.0](https://img.shields.io/badge/License-SySL--1.0-blue.svg)](https://sysl.celestia.world)
+[![GitHub](https://img.shields.io/badge/github-celestia--island%2Fcherino-blue.svg)](https://github.com/celestia-island/cherino)
+[![Docs](https://img.shields.io/badge/docs-cherino.docs.celestia.world-blue)](https://cherino.docs.celestia.world)
+[![docs.rs](https://docs.rs/cherino/badge.svg)](https://docs.rs/cherino)
+[![Checks](https://img.shields.io/github/actions/workflow/status/celestia-island/cherino/checks.yml)](https://github.com/celestia-island/cherino/actions/workflows/checks.yml)
+
+</div>
+
+<div align="center">
+
+**English** ·
+[简体中文](./docs/zhs/README.md) ·
+[繁體中文](./docs/zht/README.md) ·
+[日本語](./docs/ja/README.md) ·
+[한국어](./docs/ko/README.md) ·
+[Français](./docs/fr/README.md) ·
+[Español](./docs/es/README.md) ·
+[Русский](./docs/ru/README.md) ·
+[العربية](./docs/ar/README.md)
+
+</div>
+
+Cherino is a container operations toolkit for the celestia platform — a
+standalone [Rust](https://www.rust-lang.org/) library providing a unified,
+runtime-agnostic API for creating and managing sandboxed containers.
 
 `cherino` defines the [`ContainerOps`] trait — the full container lifecycle
 (create, start, stop, exec, file copy, snapshots, volumes, images) — plus a
@@ -104,11 +132,6 @@ This repository's code is substantially AI-generated and is licensed under the
 [SySL-1.0](LICENSE) license. See the `sysl` repository
 (<https://github.com/celestia-island/sysl>) for the license text, the model
 disclosure appended to this repo's [LICENSE](LICENSE), and the FAQ.
-
-## Logo
-
-<!-- TODO: project logo pending; drop an SVG here and reference it from this
-     README and the docs when available. -->
 
 ## License
 

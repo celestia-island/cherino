@@ -1,5 +1,3 @@
-<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
-
 <h1 align="center">Cherino</h1>
 
 <p align="center"><strong>عدة موحّدة لعمليات الحاويات، مستقلة عن وقت التشغيل، لمنصة celestia</strong></p>
@@ -36,9 +34,9 @@ Cherino هي عدة لعمليات الحاويات خاصة بمنصة celestia
 
 | الحِزمة | الوصف |
 |-------|-------------|
-| [`cherino-macros`](../../crates/cherino-macros) | ماكرو الاشتقاق `Getters` المستخدم في أنواع DTO |
-| [`cherino`](../../crates/cherino) | سمة `ContainerOps`، واجهة Docker الخلفية، ملفات الأمان، الأنواع المشتركة |
-| [`cherino-runtime`](../../crates/cherino-runtime) | واجهة OCI الخلفية عبر Youki/libcontainer (خاصة بـ Linux فقط، مع بدائل شكلية للأنظمة الأخرى) |
+| [`cherino-macros`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-macros) | ماكرو الاشتقاق `Getters` المستخدم في أنواع DTO |
+| [`cherino`](https://github.com/celestia-island/cherino/tree/master/crates/cherino) | سمة `ContainerOps`، واجهة Docker الخلفية، ملفات الأمان، الأنواع المشتركة |
+| [`cherino-runtime`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-runtime) | واجهة OCI الخلفية عبر Youki/libcontainer (خاصة بـ Linux فقط، مع بدائل شكلية للأنظمة الأخرى) |
 
 ## الواجهات الخلفية لـ ContainerOps
 

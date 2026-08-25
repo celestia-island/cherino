@@ -1,5 +1,3 @@
-<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
-
 <h1 align="center">Cherino</h1>
 
 <p align="center"><strong>Unified, runtime-agnostic container operations toolkit for the celestia platform</strong></p>
@@ -43,9 +41,9 @@ adds an OCI-native rootless backend built on
 
 | Crate | Description |
 |-------|-------------|
-| [`cherino-macros`](crates/cherino-macros) | `Getters` derive macro used by the DTO types |
-| [`cherino`](crates/cherino) | `ContainerOps` trait, Docker backend, security profiles, shared types |
-| [`cherino-runtime`](crates/cherino-runtime) | Youki/libcontainer OCI backend (Linux-only, non-Linux stubs) |
+| [`cherino-macros`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-macros) | `Getters` derive macro used by the DTO types |
+| [`cherino`](https://github.com/celestia-island/cherino/tree/master/crates/cherino) | `ContainerOps` trait, Docker backend, security profiles, shared types |
+| [`cherino-runtime`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-runtime) | Youki/libcontainer OCI backend (Linux-only, non-Linux stubs) |
 
 ## ContainerOps backends
 

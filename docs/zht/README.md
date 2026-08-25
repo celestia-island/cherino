@@ -1,5 +1,3 @@
-<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
-
 <h1 align="center">Cherino</h1>
 
 <p align="center"><strong>celestia 平台專用、統一且與 runtime 無關的容器操作工具組</strong></p>
@@ -43,9 +41,9 @@ OCI 原生 rootless backend。
 
 | Crate | 說明 |
 |-------|-------------|
-| [`cherino-macros`](../../crates/cherino-macros) | DTO 型別使用的 `Getters` derive 巨集 |
-| [`cherino`](../../crates/cherino) | `ContainerOps` trait、Docker backend、安全性設定檔、共用型別 |
-| [`cherino-runtime`](../../crates/cherino-runtime) | Youki/libcontainer OCI backend（僅限 Linux，非 Linux 平台提供 stub） |
+| [`cherino-macros`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-macros) | DTO 型別使用的 `Getters` derive 巨集 |
+| [`cherino`](https://github.com/celestia-island/cherino/tree/master/crates/cherino) | `ContainerOps` trait、Docker backend、安全性設定檔、共用型別 |
+| [`cherino-runtime`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-runtime) | Youki/libcontainer OCI backend（僅限 Linux，非 Linux 平台提供 stub） |
 
 ## ContainerOps backends
 

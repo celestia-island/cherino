@@ -1,5 +1,3 @@
-<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
-
 <h1 align="center">Cherino</h1>
 
 <p align="center"><strong>Унифицированный, независимый от рантайма набор инструментов для операций с контейнерами платформы celestia</strong></p>
@@ -44,9 +42,9 @@ Cherino — набор инструментов для операций с ко�
 
 | Crate | Описание |
 |-------|-------------|
-| [`cherino-macros`](../../crates/cherino-macros) | derive-макрос `Getters`, используемый DTO-типами |
-| [`cherino`](../../crates/cherino) | трейт `ContainerOps`, бэкенд Docker, профили безопасности, общие типы |
-| [`cherino-runtime`](../../crates/cherino-runtime) | OCI-бэкенд Youki/libcontainer (только Linux, на остальных платформах — заглушки) |
+| [`cherino-macros`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-macros) | derive-макрос `Getters`, используемый DTO-типами |
+| [`cherino`](https://github.com/celestia-island/cherino/tree/master/crates/cherino) | трейт `ContainerOps`, бэкенд Docker, профили безопасности, общие типы |
+| [`cherino-runtime`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-runtime) | OCI-бэкенд Youki/libcontainer (только Linux, на остальных платформах — заглушки) |
 
 ## Бэкенды ContainerOps
 

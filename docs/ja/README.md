@@ -1,5 +1,3 @@
-<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
-
 <h1 align="center">Cherino</h1>
 
 <p align="center"><strong>celestia プラットフォーム向けの、統一されたランタイム非依存コンテナ操作ツールキット</strong></p>
@@ -45,9 +43,9 @@ OCI ネイティブの rootless バックエンドを追加します。
 
 | Crate | 説明 |
 |-------|-------------|
-| [`cherino-macros`](../../crates/cherino-macros) | DTO 型で使用される `Getters` derive マクロ |
-| [`cherino`](../../crates/cherino) | `ContainerOps` トレイト、Docker バックエンド、セキュリティプロファイル、共有型 |
-| [`cherino-runtime`](../../crates/cherino-runtime) | Youki/libcontainer OCI バックエンド (Linux 専用、非 Linux ではスタブ) |
+| [`cherino-macros`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-macros) | DTO 型で使用される `Getters` derive マクロ |
+| [`cherino`](https://github.com/celestia-island/cherino/tree/master/crates/cherino) | `ContainerOps` トレイト、Docker バックエンド、セキュリティプロファイル、共有型 |
+| [`cherino-runtime`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-runtime) | Youki/libcontainer OCI バックエンド (Linux 専用、非 Linux ではスタブ) |
 
 ## ContainerOps バックエンド
 

@@ -1,5 +1,3 @@
-<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
-
 <h1 align="center">Cherino</h1>
 
 <p align="center"><strong>celestia 플랫폼을 위한 통합적이고 런타임에 구애받지 않는 컨테이너 운영 툴킷</strong></p>
@@ -43,9 +41,9 @@ Landlock, egress 제어, 레지스트리 화이트리스트)를 포함합니다.
 
 | Crate | 설명 |
 |-------|-------------|
-| [`cherino-macros`](../../crates/cherino-macros) | DTO 타입에서 사용하는 `Getters` derive 매크로 |
-| [`cherino`](../../crates/cherino) | `ContainerOps` trait, Docker 백엔드, 보안 프로필, 공유 타입 |
-| [`cherino-runtime`](../../crates/cherino-runtime) | Youki/libcontainer OCI 백엔드 (Linux 전용, 비 Linux에서는 스텁) |
+| [`cherino-macros`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-macros) | DTO 타입에서 사용하는 `Getters` derive 매크로 |
+| [`cherino`](https://github.com/celestia-island/cherino/tree/master/crates/cherino) | `ContainerOps` trait, Docker 백엔드, 보안 프로필, 공유 타입 |
+| [`cherino-runtime`](https://github.com/celestia-island/cherino/tree/master/crates/cherino-runtime) | Youki/libcontainer OCI 백엔드 (Linux 전용, 비 Linux에서는 스텁) |
 
 ## ContainerOps 백엔드
 

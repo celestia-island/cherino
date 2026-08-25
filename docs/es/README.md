@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
+
 <h1 align="center">Cherino</h1>
 
 <p align="center"><strong>Kit de herramientas unificado e independiente del runtime para operaciones con contenedores en la plataforma celestia</strong></p>

@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/celestia-island/docs.celestia.world/master/res/logo/cherino.webp" alt="Cherino" width="240" /></p>
+
 <h1 align="center">Cherino</h1>
 
 <p align="center"><strong>celestia 平台專用、統一且與 runtime 無關的容器操作工具組</strong></p>

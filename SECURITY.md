@@ -56,3 +56,38 @@ it and do not open pull requests against it.
 ---
 *Canonical file maintained in the organization metadata repository; changes apply to
 every repository that adopts it.*
+
+<!-- repository-specific notes below this line -->
+## What this repository builds
+
+`cherino` builds and manages sandboxed containers. Security-relevant surfaces,
+beyond the organization-wide list:
+
+- seccomp / AppArmor / Landlock profile generation (`cherino::seccomp`,
+  `cherino::apparmor`, `cherino::landlock`);
+- egress and registry-whitelist policy enforcement (`cherino::egress`,
+  `cherino::registry_whitelist`);
+- the rootless OCI backend (`cherino-runtime`).
+
+The development-only escape hatches (`CHERINO_APPARMOR_UNCONFINED`,
+`DISABLE_SECCOMP`) must never be set in production. Reports about their misuse in
+a deployment are out of scope for this repository — they are deployment
+configuration errors.
+
+## Local verification before opening a pull request
+
+```console
+just check        # cargo check --workspace --all-features
+just test         # cargo test --workspace
+just lint         # cargo fmt --all --check + clippy -D warnings
+```
+
+## Code style
+
+- Rust edition 2024, MSRV 1.91, `rustfmt` with `max_width = 100`.
+- Clippy must pass with `-D warnings` across `--all-features --tests`.
+- Brand-sensitive identifiers (AppArmor profile names, environment overrides)
+  carry legacy compatibility paths — extend them, never silently rename them.
+- Never commit real credentials, tokens, or internal network addresses. Use
+  placeholders (`CHANGE_ME`, `test-password`, RFC 5737 `192.0.2.x`) in examples
+  and tests.

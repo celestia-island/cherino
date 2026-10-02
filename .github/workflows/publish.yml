@@ -1,6 +1,11 @@
 name: Publish crates.io
 
-on:
+# One in-flight run per ref: runs serialize — a superseded push
+# queues behind the current one (deploys/publishes are never
+# interrupted mid-flight).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
   push:
     tags: [v*]
 

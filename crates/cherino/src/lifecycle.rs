@@ -205,48 +205,67 @@ impl ContainerManager {
             // Validate network parameter to prevent Docker CLI injection
             // (e.g. network="--help" or "-x" would be interpreted as Docker
             // flags).
+            // Audit cherino-R1-2: an invalid network name used to be
+            // silently skipped (warn + continue) — the caller believed
+            // the container was on the requested network when it was
+            // not. Fail the create instead: the isolation topology is
+            // part of the contract.
             if network.starts_with('-') || network.contains(' ') {
-                warn!(
-                    container = %params.name,
-                    network = %network,
-                    "invalid network name rejected (starts with '-' or contains space)"
-                );
-            } else {
-                match tokio::process::Command::new("docker")
-                    .args(["network", "connect", &network, &response.id])
-                    .output()
-                    .await
-                {
-                    Ok(output) => {
-                        if !output.status.success() {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            // "endpoint already exists" is non-fatal — the container
-                            // is already on the network from a previous creation
-                            // attempt with the same name. Log at debug, not warn.
-                            if stderr.contains("already exists") {
-                                debug!(
-                                    container = %params.name,
-                                    network = %network,
-                                    "container already on network (non-fatal)"
-                                );
-                            } else {
-                                warn!(
-                                    container = %params.name,
-                                    network = %network,
-                                    error = %stderr,
-                                    "docker network connect failed, container may not be on network"
-                                );
-                            }
+                // The container is already created and running — tear it
+                // down before failing, mirroring the adjacent start/inspect
+                // failure paths (R2 review note: without this the
+                // fail-hard conversion leaks a live container).
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &response.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(ContainerError::OperationFailed {
+                    container_id: response.id.clone(),
+                    message: format!(
+                        "invalid network name (starts with '-' or contains space): {network:?}"
+                    ),
+                });
+            }
+            match tokio::process::Command::new("docker")
+                .args(["network", "connect", &network, &response.id])
+                .output()
+                .await
+            {
+                Ok(output) => {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        // "endpoint already exists" is non-fatal — the container
+                        // is already on the network from a previous creation
+                        // attempt with the same name. Log at debug, not warn.
+                        if stderr.contains("already exists") {
+                            debug!(
+                                container = %params.name,
+                                network = %network,
+                                "container already on network (non-fatal)"
+                            );
+                        } else {
+                            warn!(
+                                container = %params.name,
+                                network = %network,
+                                error = %stderr,
+                                "docker network connect failed, container may not be on network"
+                            );
                         }
                     }
-                    Err(e) => {
-                        warn!(
-                            container = %params.name,
-                            network = %network,
-                            error = %e,
-                            "docker network connect command failed"
-                        );
-                    }
+                }
+                Err(e) => {
+                    warn!(
+                        container = %params.name,
+                        network = %network,
+                        error = %e,
+                        "docker network connect command failed"
+                    );
                 }
             }
         }

@@ -211,6 +211,20 @@ impl ContainerManager {
             // not. Fail the create instead: the isolation topology is
             // part of the contract.
             if network.starts_with('-') || network.contains(' ') {
+                // The container is already created and running — tear it
+                // down before failing, mirroring the adjacent start/inspect
+                // failure paths (R2 review note: without this the
+                // fail-hard conversion leaks a live container).
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &response.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
                 return Err(ContainerError::OperationFailed {
                     container_id: response.id.clone(),
                     message: format!(

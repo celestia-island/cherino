@@ -734,3 +734,44 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod path_validation_tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_traversal_segments() {
+        assert!(RootfsManager::validate_path_component("../../etc", "id").is_err());
+        assert!(RootfsManager::validate_path_component("..", "id").is_err());
+        assert!(RootfsManager::validate_path_component("a/../../b", "id").is_err());
+        assert!(RootfsManager::validate_path_component("", "id").is_err());
+        assert!(RootfsManager::validate_path_component("/absolute", "id").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_safe_identifiers() {
+        assert!(RootfsManager::validate_path_component("web-1", "id").is_ok());
+        assert!(RootfsManager::validate_path_component("My_App.v2", "id").is_ok());
+        assert!(RootfsManager::validate_path_component("9lives", "id").is_ok());
+    }
+
+    #[test]
+    fn resolve_under_rejects_escape() {
+        let dir = std::env::temp_dir().join("cherino-resolve-under-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The escaped candidate must be rejected even though the target
+        // does not exist (the walk-up canonicalization handles it).
+        let err = RootfsManager::resolve_under(&dir, std::path::Path::new("../../etc/passwd"));
+        assert!(err.is_err(), "traversal must be rejected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_under_accepts_confinement() {
+        let dir = std::env::temp_dir().join("cherino-resolve-under-ok");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let ok = RootfsManager::resolve_under(&dir, std::path::Path::new("sub/file.txt"));
+        assert!(ok.is_ok(), "confined path must resolve: {:?}", ok.err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

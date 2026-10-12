@@ -218,7 +218,7 @@ impl YoukiManager {
                 }
 
                 let container_dir = self.run_dir.join(&container_id);
-                let rootfs_path = self.rootfs.container_rootfs_path(&container_id);
+                let rootfs_path = self.rootfs.container_rootfs_path(&container_id)?;
 
                 if !tokio::fs::try_exists(&rootfs_path).await.unwrap_or(false) {
                     continue;
@@ -1119,8 +1119,9 @@ impl ContainerOps for YoukiManager {
                     message: format!("serialize: {}", e),
                 }
             })?;
-            let _ =
-                tokio::fs::write(self.rootfs.snapshot_path(&sid).join(".meta.json"), meta).await;
+            if let Ok(meta_path) = self.rootfs.snapshot_path(&sid) {
+                let _ = tokio::fs::write(meta_path.join(".meta.json"), meta).await;
+            }
         }
         Ok(sid)
     }
@@ -1445,7 +1446,14 @@ impl ContainerOps for YoukiManager {
 
     async fn download_archive(&self, container_id: &str, path: &str) -> ContainerResult<Vec<u8>> {
         let rootfs = self.writable_rootfs(container_id).await?;
-        let target = rootfs.path.join(path.trim_start_matches('/'));
+        // Audit cherino-R1-1: the caller-controlled archive path was
+        // joined with only the leading '/' stripped — `../../etc/passwd`
+        // escaped the rootfs entirely (arbitrary READ). Resolve under
+        // the rootfs with canonicalization.
+        let target = crate::linux::rootfs::RootfsManager::resolve_under(
+            std::path::Path::new(&rootfs.path),
+            std::path::Path::new(path.trim_start_matches('/')),
+        )?;
         if !target.exists() {
             return Ok(Vec::new());
         }
@@ -1518,7 +1526,12 @@ impl ContainerOps for YoukiManager {
         data: Vec<u8>,
     ) -> ContainerResult<()> {
         let rootfs = self.writable_rootfs(container_id).await?;
-        let target = rootfs.path.join(path.trim_start_matches('/'));
+        // Audit cherino-R1-1: same traversal hole as download (arbitrary
+        // WRITE via create_dir_all + tar unpack).
+        let target = crate::linux::rootfs::RootfsManager::resolve_under(
+            std::path::Path::new(&rootfs.path),
+            std::path::Path::new(path.trim_start_matches('/')),
+        )?;
         tokio::fs::create_dir_all(&target)
             .await
             .map_err(|e| ContainerError::OperationFailed {

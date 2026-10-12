@@ -51,12 +51,106 @@ impl RootfsManager {
         self.base_dir.join(safe_name)
     }
 
-    pub fn container_rootfs_path(&self, container_id: &str) -> PathBuf {
-        self.base_dir.join("containers").join(container_id)
+    /// Audit cherino-R1-1: validate the container id before joining —
+    /// `Path::join` does not normalize, so a caller-controlled name
+    /// containing `..` or absolute-path components could escape the
+    /// containers directory entirely.
+    pub fn container_rootfs_path(&self, container_id: &str) -> ContainerResult<PathBuf> {
+        Self::validate_path_component(container_id, "container_id")?;
+        Ok(self.base_dir.join("containers").join(container_id))
     }
 
-    pub fn snapshot_path(&self, snapshot_id: &str) -> PathBuf {
-        self.base_dir.join("snapshots").join(snapshot_id)
+    /// Audit cherino-R1-1: resolve `candidate` under `base` and reject
+    /// anything that escapes it after canonicalization (download /
+    /// upload archive paths).
+    pub fn resolve_under(
+        base: &std::path::Path,
+        candidate: &std::path::Path,
+    ) -> ContainerResult<std::path::PathBuf> {
+        let joined = base.join(candidate);
+        let canonical_base = base
+            .canonicalize()
+            .map_err(|e| ContainerError::OperationFailed {
+                container_id: String::new(),
+                message: format!("canonicalize base {:?}: {}", base, e),
+            })?;
+        // The leaf may not exist yet (upload creates it), so canonicalize
+        // the deepest existing ancestor and re-join the remainder.
+        let mut canonical = joined.clone();
+        let mut stripped = Vec::new();
+        while !canonical.exists() {
+            match (canonical.parent(), canonical.file_name()) {
+                (Some(p), Some(f)) => {
+                    stripped.push(std::path::PathBuf::from(f));
+                    canonical = p.to_path_buf();
+                }
+                _ => break,
+            }
+        }
+        let canonical = canonical
+            .canonicalize()
+            .map_err(|e| ContainerError::OperationFailed {
+                container_id: String::new(),
+                message: format!("canonicalize {:?}: {}", canonical, e),
+            })?;
+        let mut full = canonical;
+        for part in stripped.iter().rev() {
+            full = full.join(part);
+        }
+        if !full.starts_with(&canonical_base) {
+            return Err(ContainerError::OperationFailed {
+                container_id: String::new(),
+                message: format!(
+                    "path {:?} escapes the container rootfs {:?}",
+                    candidate, canonical_base
+                ),
+            });
+        }
+        Ok(full)
+    }
+
+    /// Reject empty names, `.`/`..` segments, embedded separators, and
+    /// anything outside the safe identifier charset.
+    pub fn validate_path_component(value: &str, label: &str) -> ContainerResult<()> {
+        if value.is_empty() {
+            return Err(ContainerError::OperationFailed {
+                container_id: String::new(),
+                message: format!("{} must not be empty", label),
+            });
+        }
+        if value == "." || value == ".." || value.contains("..") {
+            return Err(ContainerError::OperationFailed {
+                container_id: String::new(),
+                message: format!("{} must not contain '..' segments: {:?}", label, value),
+            });
+        }
+        if value.contains('/') || value.contains('\\') || value.contains('\0') {
+            return Err(ContainerError::OperationFailed {
+                container_id: String::new(),
+                message: format!("{} must not contain path separators", label),
+            });
+        }
+        let first = value.chars().next().unwrap();
+        let rest_ok = value
+            .chars()
+            .skip(1)
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+        if !(first.is_ascii_alphanumeric() && rest_ok) {
+            return Err(ContainerError::OperationFailed {
+                container_id: String::new(),
+                message: format!(
+                    "{} must match [a-zA-Z0-9][a-zA-Z0-9_.-]*: {:?}",
+                    label, value
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Audit cherino-R1-1: same traversal validation as container ids.
+    pub fn snapshot_path(&self, snapshot_id: &str) -> ContainerResult<PathBuf> {
+        Self::validate_path_component(snapshot_id, "snapshot_id")?;
+        Ok(self.base_dir.join("snapshots").join(snapshot_id))
     }
 
     pub async fn ensure_cache_dir(&self) -> ContainerResult<()> {
@@ -178,10 +272,7 @@ impl RootfsManager {
         } else {
             let base_path = self.base_rootfs_path(base_image);
             if base_path.is_dir() {
-                let container_path = self.container_rootfs_path(container_id);
-                if !container_path.exists() {
-                    self.copy_rootfs(&base_path, &container_path).await?;
-                }
+                let container_path = self.container_rootfs_path(container_id)?;
                 self.normalize_ownership(&container_path).await?;
                 Ok(container_path)
             } else {
@@ -207,7 +298,7 @@ impl RootfsManager {
             });
         }
 
-        let container_path = self.container_rootfs_path(container_id);
+        let container_path = self.container_rootfs_path(container_id)?;
         let upperdir = container_path.join("upper");
         let workdir = container_path.join("work");
         let merged = container_path.join("merged");
@@ -349,7 +440,7 @@ impl RootfsManager {
     }
 
     pub async fn cleanup_container_rootfs(&self, container_id: &str) -> ContainerResult<()> {
-        let container_path = self.container_rootfs_path(container_id);
+        let container_path = self.container_rootfs_path(container_id)?;
         let merged = container_path.join("merged");
 
         if merged.is_dir() {
@@ -454,8 +545,8 @@ impl RootfsManager {
         container_id: &str,
         snapshot_id: &str,
     ) -> ContainerResult<PathBuf> {
-        let src = self.container_rootfs_path(container_id);
-        let dest = self.snapshot_path(snapshot_id);
+        let src = self.container_rootfs_path(container_id)?;
+        let dest = self.snapshot_path(snapshot_id)?;
 
         if !src.exists() {
             return Err(ContainerError::NotFound(format!(

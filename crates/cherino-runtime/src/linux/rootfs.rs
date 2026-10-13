@@ -363,13 +363,7 @@ impl RootfsManager {
                 .await;
 
             if status.map(|s| s.success()).unwrap_or(false) {
-                for excluded in HOST_EXCLUDED_DIRS {
-                    let dir = merged.join(excluded);
-                    if dir.is_dir() {
-                        let _ = tokio::fs::remove_dir_all(&dir).await;
-                        let _ = tokio::fs::create_dir(&dir).await;
-                    }
-                }
+                Self::clear_host_excluded_dirs(&merged, container_id).await?;
                 info!(
                     container_id = %container_id,
                     merged = %merged_str,
@@ -422,13 +416,7 @@ impl RootfsManager {
             });
         }
 
-        for excluded in HOST_EXCLUDED_DIRS {
-            let dir = merged.join(excluded);
-            if dir.is_dir() {
-                let _ = tokio::fs::remove_dir_all(&dir).await;
-                let _ = tokio::fs::create_dir(&dir).await;
-            }
-        }
+        Self::clear_host_excluded_dirs(&merged, container_id).await?;
 
         info!(
             container_id = %container_id,
@@ -437,6 +425,40 @@ impl RootfsManager {
         );
 
         Ok(merged)
+    }
+
+    /// Audit cherino-R1-3: clear the host-excluded directories under the
+    /// mounted overlay. A failed removal leaves the lowerdir's contents
+    /// visible inside the container (in the lowerdir=/ development mode
+    /// that means host /proc|/sys|/dev) — the mount is declared FAILED
+    /// instead of silently proceeding with a weakened isolation.
+    async fn clear_host_excluded_dirs(
+        merged: &std::path::Path,
+        container_id: &str,
+    ) -> ContainerResult<()> {
+        for excluded in HOST_EXCLUDED_DIRS {
+            let dir = merged.join(excluded);
+            if dir.is_dir() {
+                if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                    return Err(ContainerError::OperationFailed {
+                        container_id: container_id.to_string(),
+                        message: format!(
+                            "cannot clear host-excluded dir {excluded:?} in the overlay: {e} — \
+                             isolation would be weakened, refusing to mount"
+                        ),
+                    });
+                }
+                if let Err(e) = tokio::fs::create_dir(&dir).await {
+                    return Err(ContainerError::OperationFailed {
+                        container_id: container_id.to_string(),
+                        message: format!(
+                            "cannot recreate mount point {excluded:?} in the overlay: {e}"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn cleanup_container_rootfs(&self, container_id: &str) -> ContainerResult<()> {

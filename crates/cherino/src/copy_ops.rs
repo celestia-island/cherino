@@ -154,6 +154,10 @@ pub fn filter_tar_to_changed_paths(
     };
 
     let mut buf = Vec::new();
+    // Audit cherino-R1-5: track attempted vs successfully appended
+    // entries so a silently incomplete archive is diagnosable.
+    let mut total_entries = 0usize;
+    let mut appended = 0usize;
     {
         let mut builder = tar::Builder::new(&mut buf);
 
@@ -207,12 +211,28 @@ pub fn filter_tar_to_changed_paths(
                 header.set_cksum();
 
                 let mut data = Vec::new();
+                total_entries += 1;
                 if entry.read_to_end(&mut data).is_ok()
                     && let Err(e) = builder.append(&header, data.as_slice())
                 {
                     warn!(error = %e, path = %entry_path, "filter_tar: failed to append entry");
+                } else {
+                    appended += 1;
                 }
             }
+        }
+
+        // Audit cherino-R1-5: the caller could not tell a complete
+        // archive from one with silently dropped entries — surface the
+        // count so an incomplete transfer is diagnosable.
+        let dropped = total_entries - appended;
+        if dropped > 0 {
+            warn!(
+                dropped = dropped,
+                total = total_entries,
+                "filter_tar: dropped {dropped} of {total_entries} entries \
+                 (unreadable or append-failed); the archive is incomplete"
+            );
         }
 
         if let Err(e) = builder.finish() {

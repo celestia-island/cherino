@@ -266,6 +266,13 @@ impl CliContainerBackend {
 
         if params.read_only_rootfs.unwrap_or(false) {
             args.push("--read-only".to_string());
+            // Read-only rootfs needs tmpfs scratch paths (see
+            // `security_profile::READONLY_SCRATCH_PATHS`) — mirror the Docker
+            // backend so images writing to /tmp or /run keep working.
+            for path in crate::security_profile::READONLY_SCRATCH_PATHS {
+                args.push("--tmpfs".to_string());
+                args.push(path.to_string());
+            }
         }
 
         if let Some(ref network) = params.network {
@@ -1419,6 +1426,12 @@ mod tests {
 
         let args = CliContainerBackend::build_run_args(&params);
         assert!(args.contains(&"--read-only".to_string()));
+        // Read-only rootfs must come with the tmpfs scratch paths, mirroring
+        // the Docker backend.
+        for path in crate::security_profile::READONLY_SCRATCH_PATHS {
+            let paired = args.windows(2).any(|w| w[0] == "--tmpfs" && w[1] == path);
+            assert!(paired, "--tmpfs {path} must follow --read-only");
+        }
     }
 
     #[test]

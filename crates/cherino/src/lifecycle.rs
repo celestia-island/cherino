@@ -124,6 +124,13 @@ impl ContainerManager {
         let egress = params.egress_policy.as_ref().unwrap_or(&default_egress);
         egress.apply_to_docker_config(&mut host_config);
 
+        // A read-only rootfs needs tmpfs scratch paths, otherwise images that
+        // write to /tmp (or /run pidfiles) break at runtime. The merge keeps
+        // caller-provided tmpfs options.
+        if host_config.readonly_rootfs == Some(true) {
+            security_profile::apply_readonly_scratch(&mut host_config);
+        }
+
         let healthcheck = params
             .healthcheck
             .as_ref()
@@ -626,7 +633,9 @@ impl ContainerManager {
             cap_drop: sec.cap_drop,
             cap_add: sec.cap_add,
             security_opt: sec.security_opt,
-            read_only_rootfs: None,
+            // Preserve the read-only rootfs of the container being replaced —
+            // recreating must never silently downgrade rootfs immutability.
+            read_only_rootfs: old_host.and_then(|h| h.readonly_rootfs),
             egress_policy: sec.egress_policy,
             group_add: None,
             devices: Vec::new(),

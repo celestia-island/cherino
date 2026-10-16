@@ -16,6 +16,11 @@ pub struct YoukiContainerRecord {
     /// Non-root user ("uid[:gid]") the container was created with, carried so
     /// `recreate` can preserve it instead of silently falling back to uid 0.
     pub user: Option<String>,
+    /// Whether the container was created with a read-only rootfs, carried so
+    /// `recreate` preserves rootfs immutability instead of silently reverting
+    /// to a writable layer. Rebuilt from the bundle's `config.json` on
+    /// reconcile.
+    pub read_only_rootfs: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

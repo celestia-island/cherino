@@ -130,7 +130,7 @@ fn recreate_params(old: &YoukiContainerRecord, new_image: &str) -> ContainerCrea
         cap_drop: None,
         cap_add: None,
         security_opt: None,
-        read_only_rootfs: None,
+        read_only_rootfs: old.read_only_rootfs,
         egress_policy: None,
         group_add: None,
         devices: Vec::new(),
@@ -239,6 +239,12 @@ impl YoukiManager {
                     ContainerStatus::Exited
                 };
 
+                // Rebuild the read-only flag from the persisted OCI spec so a
+                // recreated container keeps its immutable rootfs.
+                let read_only_rootfs = oci_spec::runtime::Spec::load(&config_path)
+                    .ok()
+                    .and_then(|spec| spec.root().as_ref().and_then(|root| root.readonly()));
+
                 let record = YoukiContainerRecord {
                     info: ContainerInfo {
                         id: container_id.clone(),
@@ -260,6 +266,7 @@ impl YoukiManager {
                     finished_at: None,
                     error: None,
                     user: None,
+                    read_only_rootfs,
                 };
 
                 records.push(record);
@@ -339,6 +346,7 @@ impl YoukiManager {
                 finished_at: None,
                 error: None,
                 user: None,
+                read_only_rootfs: None,
             })
             .await;
     }
@@ -739,6 +747,7 @@ impl ContainerOps for YoukiManager {
                 finished_at: None,
                 error: None,
                 user: params.user.clone(),
+                read_only_rootfs: params.read_only_rootfs,
             })
             .await;
 
@@ -1605,6 +1614,7 @@ mod tests {
             finished_at: None,
             error: None,
             user,
+            read_only_rootfs: None,
         }
     }
 
@@ -1627,6 +1637,25 @@ mod tests {
         assert!(
             cp.user.is_none(),
             "recreate of an unknown-user record must stay None (not fabricate uid 0)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recreate_params_preserves_read_only_rootfs() -> Result<()> {
+        let mut record = make_record(None);
+        record.read_only_rootfs = Some(true);
+        let cp = recreate_params(&record, "new:latest");
+        assert_eq!(
+            cp.read_only_rootfs,
+            Some(true),
+            "recreate must preserve rootfs immutability, not silently revert to writable"
+        );
+
+        let cp_unknown = recreate_params(&make_record(None), "new:latest");
+        assert_eq!(
+            cp_unknown.read_only_rootfs, None,
+            "unknown read-only state stays None (recreate does not fabricate)"
         );
         Ok(())
     }

@@ -678,6 +678,44 @@ mod tests {
     }
 
     #[test]
+    fn root_readonly_follows_params() -> Result<()> {
+        let tmp = tempfile::tempdir().context("test precondition")?;
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir_all(&run_dir)?;
+
+        // Default stays writable (explicit opt-in semantics at the spec layer;
+        // presets opt the cosmos sandbox in).
+        let spec = generate_oci_spec(&default_params(), &rootfs, "ro-default", &run_dir)?;
+        assert_ne!(
+            spec.root().as_ref().and_then(|r| r.readonly()),
+            Some(true),
+            "spec layer must not fabricate a read-only root"
+        );
+
+        let mut params = default_params();
+        params.read_only_rootfs = Some(true);
+        let spec = generate_oci_spec(&params, &rootfs, "ro-on", &run_dir)?;
+        assert_eq!(
+            spec.root().as_ref().and_then(|r| r.readonly()),
+            Some(true),
+            "read_only_rootfs must mark the OCI root readonly"
+        );
+        // Scratch must stay writable: /tmp is a tmpfs mount, not part of the
+        // immutable rootfs.
+        let mounts = spec.mounts().as_ref().context("mounts expected")?;
+        assert!(
+            mounts.iter().any(|m| {
+                m.destination() == &std::path::PathBuf::from("/tmp")
+                    && m.typ().as_ref().map(String::as_str) == Some("tmpfs")
+            }),
+            "read-only root must keep a tmpfs /tmp scratch mount"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn seccomp_applied_in_default_profile() -> Result<()> {
         let params = default_params();
         let seccomp = build_seccomp(&params, "test").context("test precondition")?;

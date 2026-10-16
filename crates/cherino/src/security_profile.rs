@@ -4,7 +4,35 @@ pub struct ContainerSecurity {
     pub cap_drop: Option<Vec<String>>,
     pub cap_add: Option<Vec<String>>,
     pub security_opt: Option<Vec<String>>,
+    /// Immutable container rootfs (`readonly_rootfs`). `Some(true)` hardens the
+    /// sandbox rootfs; scratch space is provided by tmpfs mounts (see
+    /// [`apply_readonly_scratch`]). `None` leaves the writable rootfs default
+    /// (infrastructure containers whose images write into system paths).
+    pub read_only_rootfs: Option<bool>,
     pub egress_policy: Option<EgressPolicy>,
+}
+
+/// tmpfs scratch paths layered onto a container whenever the rootfs is made
+/// read-only, so standard toolchains (compilers, package managers, shells)
+/// keep a writable scratch area without weakening rootfs immutability.
+///
+/// - `/tmp`, `/var/tmp`: POSIX scratch conventions.
+/// - `/run`: pidfiles / sockets created by images that expect a tmpfs `/run`.
+///
+/// tmpfs pages are charged to the container cgroup, so the existing memory
+/// limit caps scratch usage.
+pub const READONLY_SCRATCH_PATHS: [&str; 3] = ["/tmp", "/var/tmp", "/run"];
+
+/// Merge [`READONLY_SCRATCH_PATHS`] into a Docker `HostConfig` tmpfs map,
+/// preserving any caller-supplied tmpfs entries (caller options win on key
+/// collision).
+#[cfg(feature = "docker")]
+pub fn apply_readonly_scratch(host_config: &mut bollard::service::HostConfig) {
+    let mut tmpfs = host_config.tmpfs.take().unwrap_or_default();
+    for path in READONLY_SCRATCH_PATHS {
+        tmpfs.entry(path.to_string()).or_default();
+    }
+    host_config.tmpfs = Some(tmpfs);
 }
 
 pub fn postgres() -> ContainerSecurity {
@@ -12,6 +40,10 @@ pub fn postgres() -> ContainerSecurity {
         cap_drop: Some(vec![]),
         cap_add: None,
         security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+        // PostgreSQL writes into its data directory (a dedicated volume); the
+        // image itself also touches system paths during initdb, so the rootfs
+        // stays writable.
+        read_only_rootfs: None,
         egress_policy: Some(EgressPolicy::deny_all()),
     }
 }
@@ -28,6 +60,10 @@ pub fn scepter() -> ContainerSecurity {
         // needs. Use the named FUSE-capable profile (not apparmor=unconfined),
         // with a DEV-ONLY unconfined fallback via CHERINO_APPARMOR_UNCONFINED.
         security_opt: Some(apparmor::fuse_security_opts()),
+        // The scepter orchestrator is long-lived infrastructure: its image and
+        // runtime helpers may write into system paths, so keep the rootfs
+        // writable (the *inner* cosmos sandboxes are the hardened layer).
+        read_only_rootfs: None,
         egress_policy: Some(EgressPolicy::entelecheia_default()),
     }
 }
@@ -37,6 +73,7 @@ pub fn scepter_readonly() -> ContainerSecurity {
         cap_drop: Some(vec!["ALL".to_string()]),
         cap_add: Some(vec!["NET_BIND_SERVICE".to_string()]),
         security_opt: None,
+        read_only_rootfs: None,
         egress_policy: Some(EgressPolicy::entelecheia_default()),
     }
 }
@@ -61,6 +98,12 @@ pub fn cosmos() -> ContainerSecurity {
         // scepter may probe during startup. Use the same named FUSE-capable
         // AppArmor profile as the scepter orchestrator (not unconfined).
         security_opt: Some(apparmor::fuse_security_opts()),
+        // Ephemeral agent sandbox: hardened by default. The rootfs is an
+        // immutable snapshot (fork = copy-on-write snapshot of the rootfs);
+        // all legitimate writes go to workspace volumes or the tmpfs scratch
+        // paths (see [`READONLY_SCRATCH_PATHS`]). A compromised agent cannot
+        // persist changes into its own image layer.
+        read_only_rootfs: Some(true),
         egress_policy: Some(EgressPolicy::entelecheia_default()),
     }
 }
@@ -87,6 +130,11 @@ pub fn compile() -> ContainerSecurity {
         security_opt: Some(seccomp::build_security_opts(Some(
             seccomp::SeccompProfile::Compile,
         ))),
+        // Compile containers write toolchain state (target dirs, caches) into
+        // the caller-provided volumes; the image layer stays writable for now
+        // because some toolchains touch system paths (e.g. /etc/passwd lookups
+        // under sccache wrappers). Hardening them is tracked separately.
+        read_only_rootfs: None,
         // Compile containers legitimately need open network: they fetch
         // dependencies from arbitrary package registries (crates.io, npm, pypi,
         // Maven Central, …) and clone git dependencies, which cannot be
@@ -124,6 +172,10 @@ pub fn apply_to_host_config(
             .clone()
             .unwrap_or_else(|| seccomp::build_security_opts(None)),
     );
+    if sec.read_only_rootfs == Some(true) {
+        host_config.readonly_rootfs = Some(true);
+        apply_readonly_scratch(host_config);
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +446,88 @@ mod tests {
         ensure!(
             sec_opt.iter().any(|o| o.contains("no-new-privileges")),
             "postgres profile must have no-new-privileges"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cosmos_hardens_rootfs_by_default() -> Result<()> {
+        let sec = cosmos();
+        ensure!(
+            sec.read_only_rootfs == Some(true),
+            "cosmos preset must default to a read-only rootfs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn infrastructure_presets_keep_writable_rootfs() -> Result<()> {
+        for (name, sec) in [
+            ("postgres", postgres()),
+            ("scepter", scepter()),
+            ("scepter_readonly", scepter_readonly()),
+            ("compile", compile()),
+        ] {
+            ensure!(
+                sec.read_only_rootfs.is_none(),
+                "{} preset must not force a read-only rootfs",
+                name
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn apply_cosmos_sets_readonly_and_scratch_tmpfs() -> Result<()> {
+        let sec = cosmos();
+        let mut hc = bollard::service::HostConfig::default();
+        apply_to_host_config(&sec, &mut hc);
+        ensure!(
+            hc.readonly_rootfs == Some(true),
+            "cosmos profile must set readonly_rootfs"
+        );
+        let tmpfs = hc.tmpfs.context("cosmos profile must set tmpfs scratch")?;
+        for path in READONLY_SCRATCH_PATHS {
+            ensure!(
+                tmpfs.contains_key(path),
+                "scratch path {} must be a tmpfs mount",
+                path
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn apply_scepter_leaves_rootfs_writable() -> Result<()> {
+        let sec = scepter();
+        let mut hc = bollard::service::HostConfig::default();
+        apply_to_host_config(&sec, &mut hc);
+        ensure!(
+            hc.readonly_rootfs.is_none(),
+            "scepter profile must not flip readonly_rootfs"
+        );
+        ensure!(hc.tmpfs.is_none(), "scepter profile must not add tmpfs");
+        Ok(())
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn readonly_scratch_preserves_caller_tmpfs_options() -> Result<()> {
+        let mut hc = bollard::service::HostConfig::default();
+        let mut caller = std::collections::HashMap::new();
+        caller.insert("/tmp".to_string(), "size=64m".to_string());
+        hc.tmpfs = Some(caller);
+        apply_readonly_scratch(&mut hc);
+        let tmpfs = hc.tmpfs.context("tmpfs expected")?;
+        ensure!(
+            tmpfs.get("/tmp").map(String::as_str) == Some("size=64m"),
+            "caller-provided tmpfs options must win"
+        );
+        ensure!(
+            tmpfs.contains_key("/var/tmp") && tmpfs.contains_key("/run"),
+            "missing scratch paths must be filled in"
         );
         Ok(())
     }

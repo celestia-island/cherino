@@ -26,14 +26,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
       # Topological order: cherino-macros -> cherino -> cherino-runtime.
       # Per-crate skip guards make a retried tag run idempotent when an
       # earlier step already succeeded; the crates.io API requires a

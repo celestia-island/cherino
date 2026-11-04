@@ -11,8 +11,49 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
+  # ── Refuse to publish anything but the version the tag names ────────────-
+  # Before this job the skip guards probed the TAG version while
+  # `cargo publish` shipped the MANIFEST version — the two could diverge
+  # silently (versioning-audit W4, 2026-11-04; the release lane had been
+  # idle since before the current workflow shape existed).
+  verify-version:
+    name: Verify version matches tag
+    runs-on: [self-hosted, linux, x64, local]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        env:
+          GIT_CONFIG_COUNT: "0"
+      - name: Compare tag with the workspace manifest
+        run: |
+          WANT="${GITHUB_REF_NAME#v}"
+          HAVE=$(awk '
+            /^\[workspace\.package\]/ { in_ws = 1; next }
+            /^\[/ { in_ws = 0 }
+            in_ws && /^version[[:space:]]*=/ {
+              sub(/^version[[:space:]]*=[[:space:]]*"/, ""); sub(/".*$/, ""); print; exit
+            }' Cargo.toml)
+          if [ "$HAVE" != "$WANT" ]; then
+            echo "::error::workspace version ($HAVE) != tag version ($WANT)"
+            exit 1
+          fi
+          echo "Publishing version $HAVE"
+
+  # ── Semver gate: first release diffs nothing (no crates.io baseline),
+  #    printed as a notice; from the second release on, a tag whose API
+  #    diff requires a bigger bump never reaches crates.io
+  #    (versioning-audit B2, 2026-11-04). Pinned devtools ref per H14.
+  semver-checks:
+    name: Semver API diff (published crates)
+    uses: celestia-island/celestia-devtools/.github/workflows/semver-checks.yml@ff571025fd669a3474446c7b7bb6fe29f5153336
+    with:
+      runs-on-json: '["self-hosted", "linux", "x64", "local"]'
+
   publish:
     name: Publish to crates.io
+    needs: [verify-version, semver-checks]
     runs-on: [self-hosted, linux, x64, local]
     timeout-minutes: 20
     permissions:

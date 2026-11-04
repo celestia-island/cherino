@@ -213,3 +213,24 @@ impl cherino::ops::ContainerOps for YoukiManager {
         Box::new(YoukiManager)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cherino::ops::ContainerOps as _;
+
+    /// The stub deliberately does NOT override `storage_root`: a backend
+    /// without a real storage tree must surface the trait's Unsupported
+    /// error instead of naming a path a consumer could mistake for usable.
+    #[tokio::test]
+    async fn storage_root_stays_unsupported_on_the_stub() {
+        let err = YoukiManager
+            .storage_root()
+            .await
+            .expect_err("stub storage_root must not succeed");
+        assert!(
+            matches!(err, cherino::errors::ContainerError::UnsupportedBackend(_)),
+            "unexpected error shape: {err}"
+        );
+    }
+}

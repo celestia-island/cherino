@@ -84,6 +84,8 @@ pub mod ops;
 pub mod registry_whitelist;
 pub mod seccomp;
 pub mod security_profile;
+#[cfg(feature = "docker")]
+pub mod system_ops;
 pub mod toolchain;
 pub mod types;
 #[cfg(feature = "docker")]

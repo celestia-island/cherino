@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path};
 use async_trait::async_trait;
 
 use super::{
-    errors::ContainerResult,
+    errors::{ContainerError, ContainerResult},
     types::{
         ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo, ExecOutput,
         ImageInfo, PathChange, WritableRootfs,
@@ -87,6 +87,24 @@ pub trait ContainerOps: Send + Sync {
     async fn volume_exists(&self, name: &str) -> ContainerResult<bool>;
     async fn list_volumes(&self) -> ContainerResult<Vec<super::types::DockerVolumeInfo>>;
 
+    // -- Storage Topology --
+
+    /// The backend's storage root: the directory under which this backend
+    /// keeps writable state (Docker's data-root — overlay2 / containers /
+    /// volumes; the youki data dir — rootfs cache / containers). Storage
+    /// hygiene consumers (reclaim debt governance, §2.27) use it as the
+    /// usage-probe and trim anchor path.
+    ///
+    /// Default: [`ContainerError::UnsupportedBackend`] — backends opt in.
+    /// The path may be invisible to the caller's mount namespace (an
+    /// engine in a container cannot see the host's data-root); consumers
+    /// must degrade explicitly rather than guessing substitute paths.
+    async fn storage_root(&self) -> ContainerResult<std::path::PathBuf> {
+        Err(ContainerError::UnsupportedBackend(
+            "storage_root is not implemented by this backend".to_string(),
+        ))
+    }
+
     // -- Logs --
 
     async fn logs(&self, container_id: &str, tail: usize) -> ContainerResult<Vec<String>>;
@@ -143,5 +161,78 @@ pub trait ContainerOps: Send + Sync {
 impl Clone for Box<dyn ContainerOps> {
     fn clone(&self) -> Self {
         self.clone_boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend that implements NOTHING: every trait method inherits its
+    /// default or errors out. Its only job is pinning default-method arms
+    /// (storage_root today) so the trait contract stays explicit — a
+    /// backend that never opted in must surface Unsupported, never a path
+    /// a hygiene consumer could mistake for usable.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct NullBackend;
+
+    macro_rules! unimplemented_arm {
+        ($($method:ident($($arg:ident: $ty:ty),*) -> $ret:ty),* $(,)?) => {
+            #[async_trait::async_trait]
+            impl ContainerOps for NullBackend {
+                $(async fn $method(&self, $(_: $ty),*) -> $ret {
+                    Err(ContainerError::UnsupportedBackend(stringify!($method).to_string()))
+                })*
+                fn clone_boxed(&self) -> Box<dyn ContainerOps> {
+                    Box::new(*self)
+                }
+            }
+        };
+    }
+
+    unimplemented_arm! {
+        create(_p: &ContainerCreateParams) -> ContainerResult<ContainerInfo>,
+        start(_id: &str) -> ContainerResult<()>,
+        stop(_id: &str) -> ContainerResult<()>,
+        remove(_id: &str, _force: bool) -> ContainerResult<()>,
+        restart(_id: &str) -> ContainerResult<()>,
+        list() -> ContainerResult<Vec<ContainerInfo>>,
+        list_with_filter(_p: Option<&str>, _l: Option<HashMap<String, String>>, _all: bool) -> ContainerResult<Vec<ContainerInfo>>,
+        inspect(_id: &str) -> ContainerResult<ContainerDetail>,
+        is_running(_id: &str) -> ContainerResult<bool>,
+        exec(_id: &str, _cmd: &[&str]) -> ContainerResult<ExecOutput>,
+        fork(_p: &ContainerForkParams) -> ContainerResult<ContainerInfo>,
+        commit(_id: &str, _r: &str, _t: Option<&str>) -> ContainerResult<String>,
+        commit_with_labels(_id: &str, _r: &str, _t: Option<&str>, _l: Option<&HashMap<String, String>>) -> ContainerResult<String>,
+        wait_healthy(_id: &str, _t: std::time::Duration) -> ContainerResult<()>,
+        ensure_running(_id: &str) -> ContainerResult<ContainerInfo>,
+        recreate(_n: &str, _i: &str) -> ContainerResult<ContainerInfo>,
+        list_images() -> ContainerResult<Vec<ImageInfo>>,
+        pull_image(_i: &str) -> ContainerResult<String>,
+        image_exists(_i: &str) -> ContainerResult<bool>,
+        remove_image(_i: &str, _f: bool) -> ContainerResult<()>,
+        remove_with_image(_c: &str, _i: &str, _f: bool) -> ContainerResult<()>,
+        create_volume(_n: &str) -> ContainerResult<String>,
+        remove_volume(_n: &str, _f: bool) -> ContainerResult<()>,
+        volume_exists(_n: &str) -> ContainerResult<bool>,
+        list_volumes() -> ContainerResult<Vec<crate::types::DockerVolumeInfo>>,
+        get_container_logs(_id: &str, _t: usize) -> ContainerResult<String>,
+        writable_rootfs(_id: &str) -> ContainerResult<WritableRootfs>,
+        diff_workspace(_c: &str, _w: &Path, _b: &str) -> ContainerResult<Vec<crate::types::PathChange>>,
+        download_archive(_c: &str, _p: &str) -> ContainerResult<Vec<u8>>,
+        upload_archive(_c: &str, _p: &str, _d: Vec<u8>) -> ContainerResult<()>,
+        logs(_id: &str, _t: usize) -> ContainerResult<Vec<String>>
+    }
+
+    #[tokio::test]
+    async fn storage_root_defaults_to_unsupported() {
+        let err = NullBackend
+            .storage_root()
+            .await
+            .expect_err("default arm must not fabricate a path");
+        assert!(
+            matches!(err, ContainerError::UnsupportedBackend(_)),
+            "unexpected error shape: {err}"
+        );
     }
 }

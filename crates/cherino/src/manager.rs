@@ -335,6 +335,10 @@ impl super::ops::ContainerOps for ContainerManager {
         self.list_volumes().await
     }
 
+    async fn storage_root(&self) -> ContainerResult<std::path::PathBuf> {
+        self.storage_root().await
+    }
+
     async fn logs(&self, container_id: &str, tail: usize) -> ContainerResult<Vec<String>> {
         self.logs(container_id, tail).await
     }

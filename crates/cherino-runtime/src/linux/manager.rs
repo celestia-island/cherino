@@ -143,6 +143,10 @@ fn recreate_params(old: &YoukiContainerRecord, new_image: &str) -> ContainerCrea
 pub struct YoukiManager {
     state: YoukiState,
     rootfs: RootfsManager,
+    /// The data dir this manager was constructed with (rootfs cache and
+    /// container rootfs trees live under `<data_dir>/rootfs`); exposed via
+    /// `ContainerOps::storage_root` for storage hygiene consumers.
+    data_dir: PathBuf,
     run_dir: PathBuf,
     event_tx: tokio::sync::broadcast::Sender<ContainerEvent>,
 }
@@ -154,6 +158,7 @@ impl YoukiManager {
         Ok(Self {
             state: YoukiState::new(),
             rootfs: RootfsManager::new(data_dir),
+            data_dir: data_dir.to_path_buf(),
             run_dir,
             event_tx,
         })
@@ -317,6 +322,7 @@ impl YoukiManager {
         Self {
             state: YoukiState::new(),
             rootfs: RootfsManager::new(data_dir),
+            data_dir: data_dir.to_path_buf(),
             run_dir: run_dir.to_path_buf(),
             event_tx,
         }
@@ -1329,6 +1335,10 @@ impl ContainerOps for YoukiManager {
         Ok(self.run_dir.join("volumes").join(name).is_dir())
     }
 
+    async fn storage_root(&self) -> ContainerResult<std::path::PathBuf> {
+        Ok(self.data_dir.clone())
+    }
+
     async fn list_volumes(&self) -> ContainerResult<Vec<DockerVolumeInfo>> {
         let d = self.run_dir.join("volumes");
         if !d.exists() {
@@ -1590,6 +1600,19 @@ mod tests {
 
     fn make_mgr(tmp: &TempDir) -> YoukiManager {
         YoukiManager::new_for_test(tmp.path(), tmp.path())
+    }
+
+    /// storage_root must be the data_dir the manager was constructed with —
+    /// the storage hygiene consumer anchors its usage probe / trim exactly
+    /// there, and any other path (run dir, `<data_dir>/rootfs` subdir)
+    /// would point the probe at the wrong filesystem slice.
+    #[tokio::test]
+    async fn storage_root_is_the_constructor_data_dir() -> Result<()> {
+        let tmp = TempDir::new().context("test precondition")?;
+        let mgr = make_mgr(&tmp);
+        let root = mgr.storage_root().await.context("storage_root")?;
+        assert_eq!(root, tmp.path(), "storage_root must echo the data_dir");
+        Ok(())
     }
 
     fn make_record(user: Option<String>) -> YoukiContainerRecord {

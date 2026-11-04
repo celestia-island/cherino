@@ -8,7 +8,7 @@ repository.workspace = true
 description = "OCI-native rootless container runtime backend for cherino, built on libcontainer (Youki)."
 license-file = "../../LICENSE"
 keywords = ["youki", "libcontainer", "oci", "containers", "runtime"]
-categories = ["containers", "os::linux-apis"]
+categories = ["os::linux-apis"]
 publish = true
 
 [dependencies]

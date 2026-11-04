@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Runtime-agnostic container operations toolkit with a Docker reference backend and layered security profiles."
 license-file = "../../LICENSE"
 keywords = ["containers", "docker", "sandbox", "oci", "bollard"]
-categories = ["containers", "api-bindings", "asynchronous"]
+categories = ["data-structures", "api-bindings", "asynchronous"]
 publish = true
 
 [features]

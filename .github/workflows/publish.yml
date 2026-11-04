@@ -76,6 +76,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # dtolnay/rust-toolchain writes CARGO_HOME=$HOME/.cargo into GITHUB_ENV
+      # (observed live: it overrides any job-level CARGO_HOME, which is how the
+      # v0.1.2 run ended up publishing against the rsproxy home again). Re-pin
+      # the isolated home AFTER the toolchain step so every later step — the
+      # prepare below, Verify workspace and the three cargo publishes — sees it.
+      - name: Re-pin the isolated CARGO_HOME after the toolchain step
+        run: echo CARGO_HOME=/tmp/publish-cargo-home >> "$GITHUB_ENV"
+
       - name: Prepare an isolated CARGO_HOME without source replacement
         run: |
           mkdir -p "$CARGO_HOME"

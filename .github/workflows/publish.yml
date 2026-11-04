@@ -51,22 +51,21 @@ jobs:
     with:
       runs-on-json: '["self-hosted", "linux", "x64", "local"]'
 
+  # The publish lane runs on the clean hosted runners (hare precedent):
+  # the self-hosted fleet's cargo configuration chain carries the rsproxy
+  # source replacement via a parent-directory config that no workflow-level
+  # CARGO_HOME can mask (job env AND a GITHUB_ENV re-pin both verified
+  # ineffective across the v0.1.1-v0.1.3 runs — cargo resolves config from
+  # the manifest's parent-directory chain, which is runner-machine-owned).
+  # A release should not fight that, and should not queue behind unrelated
+  # build jobs either.
   publish:
     name: Publish to crates.io
     needs: [verify-version, semver-checks]
-    runs-on: [self-hosted, linux, x64, local]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
-    env:
-      # The self-hosted runner's cargo home carries the rsproxy source
-      # replacement (a pull-side mirror); `cargo publish` refuses to run
-      # under a non-remote-registry replacement — observed live on the
-      # v0.1.1 run ("crates-io is replaced with non-remote-registry source
-      # registry `rsproxy`", exit 101 in Publish cherino-macros). A job-local
-      # CARGO_HOME with only a registry-token config talks to crates.io
-      # directly; dependency resolution re-downloads into it once per run.
-      CARGO_HOME: /tmp/publish-cargo-home
 
     steps:
       - uses: actions/checkout@v7
@@ -76,22 +75,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # dtolnay/rust-toolchain writes CARGO_HOME=$HOME/.cargo into GITHUB_ENV
-      # (observed live: it overrides any job-level CARGO_HOME, which is how the
-      # v0.1.2 run ended up publishing against the rsproxy home again). Re-pin
-      # the isolated home AFTER the toolchain step so every later step — the
-      # prepare below, Verify workspace and the three cargo publishes — sees it.
-      - name: Re-pin the isolated CARGO_HOME after the toolchain step
-        run: echo CARGO_HOME=/tmp/publish-cargo-home >> "$GITHUB_ENV"
-
-      - name: Prepare an isolated CARGO_HOME without source replacement
-        run: |
-          mkdir -p "$CARGO_HOME"
-          cat > "$CARGO_HOME/config.toml" <<'TOML'
-          [net]
-          retry = 3
-          TOML
-
       # Topological order: cherino-macros -> cherino -> cherino-runtime.
       # Per-crate skip guards make a retried tag run idempotent when an
       # earlier step already succeeded; the crates.io API requires a
@@ -99,12 +82,6 @@ jobs:
       - name: Verify workspace
         run: cargo check --workspace --all-features
 
-      # The self-hosted runner's cargo home carries the rsproxy source
-      # replacement (a pull-side mirror); `cargo publish` refuses to run
-      # under a non-remote-registry replacement (observed live on the
-      # v0.1.1 run: "crates-io is replaced with non-remote-registry source
-      # registry `rsproxy`"). Every publish below talks to crates.io from
-      # an isolated CARGO_HOME holding nothing but the registry token.
       - name: Publish cherino-macros
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"

@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Getters derive macro for the cherino container toolkit."
 license-file = "../../LICENSE"
 keywords = ["derive", "getters", "accessors", "proc-macro"]
-categories = ["development-tools::procedural-macros"]
+categories = ["development-tools::procedural-macro-helpers"]
 publish = true
 
 [lib]

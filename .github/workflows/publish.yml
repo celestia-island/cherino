@@ -58,6 +58,15 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+    env:
+      # The self-hosted runner's cargo home carries the rsproxy source
+      # replacement (a pull-side mirror); `cargo publish` refuses to run
+      # under a non-remote-registry replacement — observed live on the
+      # v0.1.1 run ("crates-io is replaced with non-remote-registry source
+      # registry `rsproxy`", exit 101 in Publish cherino-macros). A job-local
+      # CARGO_HOME with only a registry-token config talks to crates.io
+      # directly; dependency resolution re-downloads into it once per run.
+      CARGO_HOME: /tmp/publish-cargo-home
 
     steps:
       - uses: actions/checkout@v7
@@ -67,6 +76,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Prepare an isolated CARGO_HOME without source replacement
+        run: |
+          mkdir -p "$CARGO_HOME"
+          cat > "$CARGO_HOME/config.toml" <<'TOML'
+          [net]
+          retry = 3
+          TOML
+
       # Topological order: cherino-macros -> cherino -> cherino-runtime.
       # Per-crate skip guards make a retried tag run idempotent when an
       # earlier step already succeeded; the crates.io API requires a
@@ -74,6 +91,12 @@ jobs:
       - name: Verify workspace
         run: cargo check --workspace --all-features
 
+      # The self-hosted runner's cargo home carries the rsproxy source
+      # replacement (a pull-side mirror); `cargo publish` refuses to run
+      # under a non-remote-registry replacement (observed live on the
+      # v0.1.1 run: "crates-io is replaced with non-remote-registry source
+      # registry `rsproxy`"). Every publish below talks to crates.io from
+      # an isolated CARGO_HOME holding nothing but the registry token.
       - name: Publish cherino-macros
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"

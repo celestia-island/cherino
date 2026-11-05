@@ -365,6 +365,11 @@ pub struct DockerDiskUsage {
     pub containers_rw_bytes: u64,
     /// Sum of build-cache entries.
     pub build_cache_bytes: u64,
+    /// The daemon's own reclaimable estimate summed across buckets —
+    /// what \`docker system df\` would offer to free (dangling images,
+    /// stopped containers, unused volumes, stale build cache). A lower
+    /// bound the same way the bucket totals are.
+    pub reclaimable_bytes: u64,
 }
 
 impl DockerDiskUsage {

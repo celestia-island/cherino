@@ -35,16 +35,26 @@ impl ContainerManager {
     pub(crate) fn sum_disk_usage(
         usage: &bollard::models::SystemDataUsageResponse,
     ) -> DockerDiskUsage {
-        let bucket_total = |total: Option<i64>| total.unwrap_or(0).max(0) as u64;
+        let bucket_field = |total: Option<i64>| total.unwrap_or(0).max(0) as u64;
+        let bucket_total = |u: Option<&bollard::models::ImagesDiskUsage>| {
+            bucket_field(u.and_then(|b| b.total_size))
+        };
+        let bucket_reclaimable = |u: Option<&bollard::models::ImagesDiskUsage>| {
+            bucket_field(u.and_then(|b| b.reclaimable))
+        };
         DockerDiskUsage {
-            layers_bytes: bucket_total(usage.image_usage.as_ref().and_then(|u| u.total_size)),
-            volumes_bytes: bucket_total(usage.volume_usage.as_ref().and_then(|u| u.total_size)),
-            containers_rw_bytes: bucket_total(
+            layers_bytes: bucket_total(usage.image_usage.as_ref()),
+            volumes_bytes: bucket_field(usage.volume_usage.as_ref().and_then(|u| u.total_size)),
+            containers_rw_bytes: bucket_field(
                 usage.container_usage.as_ref().and_then(|u| u.total_size),
             ),
-            build_cache_bytes: bucket_total(
+            build_cache_bytes: bucket_field(
                 usage.build_cache_usage.as_ref().and_then(|u| u.total_size),
             ),
+            reclaimable_bytes: bucket_reclaimable(usage.image_usage.as_ref())
+                + bucket_field(usage.volume_usage.as_ref().and_then(|u| u.reclaimable))
+                + bucket_field(usage.container_usage.as_ref().and_then(|u| u.reclaimable))
+                + bucket_field(usage.build_cache_usage.as_ref().and_then(|u| u.reclaimable)),
         }
     }
 
@@ -127,6 +137,7 @@ mod tests {
         let usage = SystemDataUsageResponse {
             image_usage: Some(ImagesDiskUsage {
                 total_size: Some(1000),
+                reclaimable: Some(100),
                 ..Default::default()
             }),
             volume_usage: Some(VolumesDiskUsage {
@@ -147,6 +158,7 @@ mod tests {
         assert_eq!(summed.volumes_bytes, 200);
         assert_eq!(summed.containers_rw_bytes, 50);
         assert_eq!(summed.build_cache_bytes, 25);
+        assert_eq!(summed.reclaimable_bytes, 100);
         assert_eq!(summed.total_bytes(), 1275);
     }
 

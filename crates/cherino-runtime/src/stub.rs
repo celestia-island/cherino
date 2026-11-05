@@ -222,6 +222,12 @@ mod tests {
     /// The stub deliberately does NOT override `storage_root`: a backend
     /// without a real storage tree must surface the trait's Unsupported
     /// error instead of naming a path a consumer could mistake for usable.
+    ///
+    /// GUARD SCOPE: this module only compiles on non-Linux targets and no
+    /// CI runner executes it (all org runners are linux) — it is a
+    /// developer-side guard for non-Linux builds, not an automated gate.
+    /// The Linux-side contract (the trait DEFAULT stays Unsupported) is
+    /// pinned by `NullBackend` in `cherino/src/ops.rs`, which CI does run.
     #[tokio::test]
     async fn storage_root_stays_unsupported_on_the_stub() {
         let err = YoukiManager

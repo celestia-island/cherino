@@ -90,10 +90,15 @@ pub trait ContainerOps: Send + Sync {
     // -- Storage Topology --
 
     /// The backend's storage root: the directory under which this backend
-    /// keeps writable state (Docker's data-root — overlay2 / containers /
-    /// volumes; the youki data dir — rootfs cache / containers). Storage
-    /// hygiene consumers (reclaim debt governance, §2.27) use it as the
+    /// keeps its ON-DISK writable state (Docker's data-root — overlay2 /
+    /// containers / volumes; the youki data dir — rootfs cache and
+    /// container trees). Storage hygiene consumers use it as the
     /// usage-probe and trim anchor path.
+    ///
+    /// Coverage note: youki named volumes deliberately sit on the RUN
+    /// dir (tmpfs) and are NOT part of this root — a usage probe
+    /// anchored here sees no tmpfs volume bytes, which is the honest
+    /// number for reclaim governance (tmpfs holds no disk debt).
     ///
     /// Default: [`ContainerError::UnsupportedBackend`] — backends opt in.
     /// The path may be invisible to the caller's mount namespace (an
@@ -108,6 +113,11 @@ pub trait ContainerOps: Send + Sync {
     /// The daemon's own disk accounting for its storage root
     /// (`GET /system/df`, summed into fixed buckets) — the honest
     /// allocated figure for a data-root the caller cannot traverse.
+    /// Missing buckets are honest zeros: a total is a LOWER BOUND on the
+    /// daemon's real usage, never a measurement of emptiness. Buckets
+    /// are disjoint by the daemon's construction (containers carry only
+    /// their writable deltas; image layers are deduplicated), so
+    /// [`DockerDiskUsage::total_bytes`] does not double-count.
     /// Default: [`ContainerError::UnsupportedBackend`] — backends opt in.
     async fn docker_disk_usage(&self) -> ContainerResult<super::types::DockerDiskUsage> {
         Err(ContainerError::UnsupportedBackend(
@@ -180,9 +190,9 @@ mod tests {
 
     /// A backend that implements NOTHING: every trait method inherits its
     /// default or errors out. Its only job is pinning default-method arms
-    /// (storage_root today) so the trait contract stays explicit — a
-    /// backend that never opted in must surface Unsupported, never a path
-    /// a hygiene consumer could mistake for usable.
+    /// (storage_root, docker_disk_usage) so the trait contract stays
+    /// explicit — a backend that never opted in must surface Unsupported,
+    /// never a path or number a hygiene consumer could mistake for usable.
     #[derive(Debug, Clone, Copy, Default)]
     struct NullBackend;
 
@@ -240,6 +250,22 @@ mod tests {
             .storage_root()
             .await
             .expect_err("default arm must not fabricate a path");
+        assert!(
+            matches!(err, ContainerError::UnsupportedBackend(_)),
+            "unexpected error shape: {err}"
+        );
+    }
+
+    /// The docker_disk_usage default arm is the "no fabricated numbers"
+    /// twin of the path contract: a backend that never opted in must not
+    /// hand back a zero-filled usage struct a consumer could read as an
+    /// empty data-root.
+    #[tokio::test]
+    async fn docker_disk_usage_defaults_to_unsupported() {
+        let err = NullBackend
+            .docker_disk_usage()
+            .await
+            .expect_err("default arm must not fabricate zeros");
         assert!(
             matches!(err, ContainerError::UnsupportedBackend(_)),
             "unexpected error shape: {err}"

@@ -152,20 +152,37 @@ mod tests {
 
     #[test]
     fn disk_usage_negative_bucket_saturates_to_zero() {
-        use bollard::models::{ImagesDiskUsage, SystemDataUsageResponse};
+        use bollard::models::{
+            BuildCacheDiskUsage, ContainersDiskUsage, ImagesDiskUsage, SystemDataUsageResponse,
+            VolumesDiskUsage,
+        };
+        // All four buckets fed -1: the saturation lives in the SHARED
+        // bucket_total closure, so every arm must prove it (a future arm
+        // hand-rolled around the closure would otherwise survive).
         let usage = SystemDataUsageResponse {
             image_usage: Some(ImagesDiskUsage {
                 total_size: Some(-1),
                 ..Default::default()
             }),
-            ..Default::default()
+            volume_usage: Some(VolumesDiskUsage {
+                total_size: Some(-1),
+                ..Default::default()
+            }),
+            container_usage: Some(ContainersDiskUsage {
+                total_size: Some(-1),
+                ..Default::default()
+            }),
+            build_cache_usage: Some(BuildCacheDiskUsage {
+                total_size: Some(-1),
+                ..Default::default()
+            }),
         };
         let summed = ContainerManager::sum_disk_usage(&usage);
         assert_eq!(
-            summed.layers_bytes, 0,
-            "-1 must saturate, not poison totals"
+            summed,
+            DockerDiskUsage::default(),
+            "every -1 bucket must saturate to 0, not poison any total"
         );
-        assert_eq!(summed.total_bytes(), 0);
     }
 
     #[test]

@@ -105,6 +105,16 @@ pub trait ContainerOps: Send + Sync {
         ))
     }
 
+    /// The daemon's own disk accounting for its storage root
+    /// (`GET /system/df`, summed into fixed buckets) — the honest
+    /// allocated figure for a data-root the caller cannot traverse.
+    /// Default: [`ContainerError::UnsupportedBackend`] — backends opt in.
+    async fn docker_disk_usage(&self) -> ContainerResult<super::types::DockerDiskUsage> {
+        Err(ContainerError::UnsupportedBackend(
+            "docker_disk_usage is not implemented by this backend".to_string(),
+        ))
+    }
+
     // -- Logs --
 
     async fn logs(&self, container_id: &str, tail: usize) -> ContainerResult<Vec<String>>;

@@ -348,3 +348,32 @@ pub struct WritableRootfs {
     pub path: PathBuf,
     pub is_direct: bool,
 }
+
+/// The daemon's own accounting of the bytes it keeps under its storage
+/// root (`GET /system/df`), summed into fixed buckets. This is the
+/// authoritative figure for a data-root the caller cannot traverse
+/// (root-owned path, engine in a container): dockerd computes it from
+/// the real on-disk layers, volumes and container rw deltas — not from
+/// logical sizes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerDiskUsage {
+    /// Sum of image layer bytes (`LayersSize`; deduplicated across images).
+    pub layers_bytes: u64,
+    /// Sum of volume disk usage.
+    pub volumes_bytes: u64,
+    /// Sum of container writable-layer deltas (`SizeRw`).
+    pub containers_rw_bytes: u64,
+    /// Sum of build-cache entries.
+    pub build_cache_bytes: u64,
+}
+
+impl DockerDiskUsage {
+    /// Everything the daemon keeps under its data-root: layers + volumes
+    /// + container deltas + build cache.
+    pub fn total_bytes(&self) -> u64 {
+        self.layers_bytes
+            .saturating_add(self.volumes_bytes)
+            .saturating_add(self.containers_rw_bytes)
+            .saturating_add(self.build_cache_bytes)
+    }
+}

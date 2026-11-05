@@ -339,6 +339,10 @@ impl super::ops::ContainerOps for ContainerManager {
         self.storage_root().await
     }
 
+    async fn docker_disk_usage(&self) -> ContainerResult<super::types::DockerDiskUsage> {
+        self.disk_usage().await
+    }
+
     async fn logs(&self, container_id: &str, tail: usize) -> ContainerResult<Vec<String>> {
         self.logs(container_id, tail).await
     }

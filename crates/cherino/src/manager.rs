@@ -344,6 +344,13 @@ impl super::ops::ContainerOps for ContainerManager {
     }
 
     async fn version(&self) -> ContainerResult<Option<super::types::ContainerVersion>> {
+        // Delegation, not recursion: inherent methods win resolution inside
+        // their own trait impl, so this reaches `ContainerManager::version`.
+        // If that inherent method is ever renamed away this line starts
+        // calling THIS function — which still compiles and then hangs — so
+        // the name is load-bearing. Pinned by the ignored live-daemon test
+        // (`test_daemon_version`, through `&dyn ContainerOps`); no hermetic
+        // test can reach a body that needs a Docker socket.
         self.version().await
     }
 

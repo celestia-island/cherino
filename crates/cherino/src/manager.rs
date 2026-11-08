@@ -543,14 +543,70 @@ mod tests {
         assert_eq!(version.tags, vec!["api 1.47".to_string()]);
     }
 
+    /// The error half of the same seam: a daemon that ACCEPTS the connection
+    /// and then hangs up without answering has not told us it has no version
+    /// — it failed. The trait doc promises consumers can tell "no version"
+    /// (`Ok(None)`) from "could not read one" (`Err`), and this is the only
+    /// test that walks the second path without a daemon.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_that_hangs_up_is_an_error_not_a_silent_none() {
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock).expect("bind the fake daemon");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    // Hang up without a byte of response. One is enough: a
+                    // retry finds the listener gone and fails at connect.
+                    Ok((conn, _)) => {
+                        drop(conn);
+                        return;
+                    }
+                    Err(kind) if kind.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let docker = bollard::Docker::connect_with_socket(
+            sock.to_str().expect("socket path is utf-8"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("connect to the fake daemon");
+        let manager = ContainerManager::from_docker(docker);
+        let ops: &dyn ContainerOps = &manager;
+        let outcome = ops.version().await;
+        handle.join().expect("fake daemon thread");
+
+        let error = outcome.expect_err("a daemon that never answers is not 'no version'");
+        assert!(
+            matches!(error, ContainerError::DockerApi(_)),
+            "the failure must stay attributable to the daemon: {error:?}"
+        );
+    }
+
     /// The live half of the `/version` contract: a real daemon names its
     /// own version, and the qualifier rides in tags rather than the version
     /// slot. Ignored by default — no daemon inside the test lane.
     ///
     /// It calls through `&dyn ContainerOps` on purpose: that is the seam
-    /// the consumer (scepter's `containers` row) uses, and it is the only
-    /// thing that pins the delegation arm — calling the inherent method
-    /// would keep passing if the trait impl ever stopped forwarding.
+    /// the consumer (scepter's `containers` row) uses, and together with the
+    /// hermetic `daemon_version_through_dyn` above it pins the delegation
+    /// arm — calling the inherent method would keep passing if the trait impl
+    /// ever stopped forwarding.
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn test_daemon_version() -> Result<()> {

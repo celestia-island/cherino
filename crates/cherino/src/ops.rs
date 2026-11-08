@@ -107,11 +107,12 @@ pub trait ContainerOps: Send + Sync {
     /// failure for a backend that is answering fine.
     ///
     /// Presence is therefore PLATFORM- and arm-dependent, not type-wide: the
-    /// Linux youki backend answers, its non-Linux stub (`cherino-runtime`)
-    /// inherits the default and stays silent, and both docker and the CLI
-    /// adapters can be either depending on what is installed. Consumers must
-    /// treat `None` as "not named here", never as "this platform has no
-    /// containers".
+    /// Linux youki backend answers; its non-Linux stub (`cherino-runtime`)
+    /// inherits the default and stays silent; docker answers when the daemon
+    /// reports a version and stays silent when the payload carries none; and
+    /// the CLI adapters inherit the default too, so they never answer.
+    /// Consumers must treat `None` as "not named here", never as "this
+    /// platform has no containers".
     async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
         Ok(None)
     }

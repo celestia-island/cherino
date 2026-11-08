@@ -349,9 +349,11 @@ impl super::ops::ContainerOps for ContainerManager {
         // The NAME is load-bearing: rename that inherent method away and this
         // line starts calling THIS function — which still compiles (the
         // `#[async_trait]` body is a boxed future) and then self-recurses to a
-        // stack overflow. Pinned twice: by the ignored live-daemon test
-        // (`test_daemon_version`) and by `daemon_version_through_dyn` below,
-        // which serves a fake `/version` over a temp unix socket.
+        // stack overflow. Pinned three times: by the ignored live-daemon test
+        // (`test_daemon_version`) and by two hermetic tests below —
+        // `daemon_version_through_dyn` (a fake `/version` over a temp unix
+        // socket) and `a_daemon_that_hangs_up_is_an_error_not_a_silent_none`
+        // (a daemon that accepts and drops the connection).
         self.version().await
     }
 
@@ -473,8 +475,11 @@ mod tests {
         Ok(())
     }
 
-    /// The hermetic half of the same contract, and the only EXECUTED pin on
-    /// the `impl ContainerOps` delegation arm above: a throwaway unix socket
+    /// The hermetic half of the same contract, and one of two EXECUTED pins on
+    /// the `impl ContainerOps` delegation arm above (the sibling is
+    /// `a_daemon_that_hangs_up_is_an_error_not_a_silent_none`, which also calls
+    /// the trait object and also dies of a stack overflow if the inherent
+    /// method is renamed): a throwaway unix socket
     /// answers one `GET /version`, so the real bollard client, the real
     /// `ContainerManager`, the trait object and `map_version` all run
     /// without a daemon. Rename the inherent `version()` away and this

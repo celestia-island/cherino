@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use super::{
     errors::{ContainerError, ContainerResult},
     types::{
-        ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo, ExecOutput,
-        ImageInfo, PathChange, WritableRootfs,
+        ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo,
+        ContainerVersion, ExecOutput, ImageInfo, PathChange, WritableRootfs,
     },
 };
 
@@ -86,6 +86,36 @@ pub trait ContainerOps: Send + Sync {
     async fn remove_volume(&self, name: &str, force: bool) -> ContainerResult<()>;
     async fn volume_exists(&self, name: &str) -> ContainerResult<bool>;
     async fn list_volumes(&self) -> ContainerResult<Vec<super::types::DockerVolumeInfo>>;
+
+    // -- Identity --
+
+    /// The backend's SELF-REPORTED version, split the way consumers render
+    /// `产品名:产品版本`: the product's own version plus qualifiers that ride
+    /// after it as tags (a docker daemon's API version, say).
+    ///
+    /// Default: `Ok(None)` — "this backend cannot name its version". That is
+    /// deliberately NOT [`ContainerError::UnsupportedBackend`] the way
+    /// [`Self::storage_root`] is: a version nobody can name is simply
+    /// unnameable (the consumer renders the bare product name), while a
+    /// fabricated storage path would be dangerous. A backend that CAN answer
+    /// but fails to (daemon down, permission denied) still returns an error —
+    /// the difference between "no version" and "could not read one" is what
+    /// consumers log. One corner is deliberately NOT an error: a backend that
+    /// answers but carries no version in its answer (a 200 payload whose
+    /// version field is absent or blank) reports `Ok(None)` — the row
+    /// degrades to the bare product name, where an `Err` would log a probe
+    /// failure for a backend that is answering fine.
+    ///
+    /// Presence is therefore PLATFORM- and arm-dependent, not type-wide: the
+    /// Linux youki backend answers; its non-Linux stub (`cherino-runtime`)
+    /// inherits the default and stays silent; docker answers when the daemon
+    /// reports a version and stays silent when the payload carries none; and
+    /// the CLI adapters inherit the default too, so they never answer.
+    /// Consumers must treat `None` as "not named here", never as "this
+    /// platform has no containers".
+    async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
+        Ok(None)
+    }
 
     // -- Storage Topology --
 
@@ -190,9 +220,10 @@ mod tests {
 
     /// A backend that implements NOTHING: every trait method inherits its
     /// default or errors out. Its only job is pinning default-method arms
-    /// (storage_root, docker_disk_usage) so the trait contract stays
-    /// explicit — a backend that never opted in must surface Unsupported,
-    /// never a path or number a hygiene consumer could mistake for usable.
+    /// (storage_root, docker_disk_usage) and the version default (version →
+    /// `None`) so the trait contract stays explicit — a backend that never
+    /// opted in must surface Unsupported or "cannot name itself", never a
+    /// path, number or version string a consumer could mistake for real.
     #[derive(Debug, Clone, Copy, Default)]
     struct NullBackend;
 
@@ -254,6 +285,20 @@ mod tests {
             matches!(err, ContainerError::UnsupportedBackend(_)),
             "unexpected error shape: {err}"
         );
+    }
+
+    /// The version default arm is the third kind of "no fabricated
+    /// answers": a backend that cannot name itself renders the bare
+    /// product name, and `Ok(None)` is how it says so — never a
+    /// placeholder version, never an error a consumer would log as a probe
+    /// failure.
+    #[tokio::test]
+    async fn version_defaults_to_none() {
+        let version = NullBackend
+            .version()
+            .await
+            .expect("an unnameable version is not an error");
+        assert!(version.is_none(), "no backend may inherit a version");
     }
 
     /// The docker_disk_usage default arm is the "no fabricated numbers"

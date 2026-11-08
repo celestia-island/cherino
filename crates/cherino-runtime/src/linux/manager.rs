@@ -20,7 +20,7 @@ use cherino::{
     ops::ContainerOps,
     types::{
         ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo,
-        ContainerStatus, DockerVolumeInfo, ExecOutput, ImageInfo, ServerStatus,
+        ContainerStatus, ContainerVersion, DockerVolumeInfo, ExecOutput, ImageInfo, ServerStatus,
     },
 };
 
@@ -1339,6 +1339,14 @@ impl ContainerOps for YoukiManager {
         Ok(self.data_dir.clone())
     }
 
+    /// The in-process runtime's own version. There is no daemon to ask: the
+    /// libcontainer backend IS this crate, so its crate version is the
+    /// product version — the honest answer for the `containers` dependency
+    /// row on a host without a docker daemon.
+    async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
+        Ok(Some(ContainerVersion::new(env!("CARGO_PKG_VERSION"))))
+    }
+
     async fn list_volumes(&self) -> ContainerResult<Vec<DockerVolumeInfo>> {
         let d = self.run_dir.join("volumes");
         if !d.exists() {
@@ -1612,6 +1620,28 @@ mod tests {
         let mgr = make_mgr(&tmp);
         let root = mgr.storage_root().await.context("storage_root")?;
         assert_eq!(root, tmp.path(), "storage_root must echo the data_dir");
+        Ok(())
+    }
+
+    /// The version arm of the same contract: the libcontainer backend names
+    /// its own crate version (there is no daemon to ask), with no tags —
+    /// consumers must be able to render `containers:<version>` without a
+    /// per-backend formatting rule.
+    #[tokio::test]
+    async fn version_is_the_runtime_crate_version() -> Result<()> {
+        let tmp = TempDir::new().context("test precondition")?;
+        let mgr = make_mgr(&tmp);
+        let version = mgr
+            .version()
+            .await
+            .context("version")?
+            .context("a version")?;
+        assert_eq!(
+            version.version,
+            env!("CARGO_PKG_VERSION"),
+            "the in-process runtime must name its own crate version"
+        );
+        assert!(version.tags.is_empty(), "no qualifiers to add");
         Ok(())
     }
 

@@ -124,6 +124,6 @@ pub use toolchain::{
 };
 pub use types::{
     ChangeKind, ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo,
-    ContainerRuntimeType, ContainerStatus, DockerVolumeInfo, ExecOutput, HealthcheckParams,
-    ImageInfo, PathChange, ServerStatus, VolumeMount, WritableRootfs,
+    ContainerRuntimeType, ContainerStatus, ContainerVersion, DockerVolumeInfo, ExecOutput,
+    HealthcheckParams, ImageInfo, PathChange, ServerStatus, VolumeMount, WritableRootfs,
 };

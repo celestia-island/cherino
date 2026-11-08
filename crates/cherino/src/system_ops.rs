@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use super::{
     errors::{ContainerError, ContainerResult},
     manager::ContainerManager,
-    types::DockerDiskUsage,
+    types::{ContainerVersion, DockerDiskUsage},
 };
 
-use bollard::models::SystemInfo;
+use bollard::models::{SystemInfo, SystemVersion};
 
 /// Map a daemon `/info` payload to the storage root. A daemon that omits
 /// `DockerRootDir` — or reports it empty (defensive: the API allows an
@@ -21,6 +21,30 @@ fn map_root_dir(info: &SystemInfo) -> ContainerResult<PathBuf> {
             "dockerd did not report docker_root_dir in /info".to_string(),
         )),
     }
+}
+
+/// Map a daemon `/version` payload to the version a consumer renders after
+/// the product name. The daemon's OWN `Version` is the product version; its
+/// `ApiVersion` is a qualifier and rides in `tags` (a tag in the version slot
+/// would read as part of the product version). An absent or blank `Version`
+/// maps to `None` rather than an empty string — the panel must render a bare
+/// product name, never `containers:`. Extracted as a pure function so the
+/// tests pin the PRODUCTION mapping, not a copy of it.
+fn map_version(version: &SystemVersion) -> Option<ContainerVersion> {
+    let own = version.version.as_deref()?.trim();
+    if own.is_empty() {
+        return None;
+    }
+    let mut mapped = ContainerVersion::new(own);
+    if let Some(api) = version
+        .api_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|api| !api.is_empty())
+    {
+        mapped.tags.push(format!("api {api}"));
+    }
+    Some(mapped)
 }
 
 impl ContainerManager {
@@ -66,6 +90,14 @@ impl ContainerManager {
     pub async fn disk_usage(&self) -> ContainerResult<DockerDiskUsage> {
         let usage = self.docker.df(None).await?;
         Ok(Self::sum_disk_usage(&usage))
+    }
+
+    /// The daemon's own version (`GET /version`), split into the product
+    /// version and its qualifiers — the `containers` dependency row's
+    /// `产品名:产品版本` identity.
+    pub async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
+        let version = self.docker.version().await?;
+        Ok(map_version(&version))
     }
 
     /// The dockerd data-root (`DockerRootDir` from `/info` — overlay2,
@@ -126,6 +158,78 @@ mod tests {
             map_root_dir(&info),
             Err(ContainerError::Connection(_))
         ));
+    }
+
+    /// The `/version` mapping: daemon version in the version slot, API
+    /// version after it as a tag.
+    #[test]
+    fn reported_version_carries_the_daemon_version_and_its_api_tag() {
+        let version = SystemVersion {
+            version: Some("27.3.1".to_string()),
+            api_version: Some("1.47".to_string()),
+            ..Default::default()
+        };
+        let mapped = map_version(&version).expect("a reported version maps");
+        assert_eq!(mapped.version, "27.3.1");
+        assert_eq!(mapped.tags, vec!["api 1.47".to_string()]);
+    }
+
+    #[test]
+    fn a_daemon_without_an_api_version_adds_no_tag() {
+        let version = SystemVersion {
+            version: Some("27.3.1".to_string()),
+            api_version: None,
+            ..Default::default()
+        };
+        let mapped = map_version(&version).expect("a reported version maps");
+        assert_eq!(mapped.version, "27.3.1");
+        assert!(mapped.tags.is_empty(), "no api version → no tag");
+        // A blank api version is the same as none: an `api ` tag with no
+        // number would be a label, not a qualifier.
+        let blank = SystemVersion {
+            version: Some("27.3.1".to_string()),
+            api_version: Some("  ".to_string()),
+            ..Default::default()
+        };
+        assert!(map_version(&blank).expect("maps").tags.is_empty());
+    }
+
+    /// Both slots are trimmed before they reach a consumer: a daemon (or a
+    /// proxy rewriting its answer) that pads the field must still render as
+    /// `containers:27.3.1 api 1.47`, not with the padding visible.
+    #[test]
+    fn padded_version_and_api_version_are_trimmed() {
+        let version = SystemVersion {
+            version: Some("  27.3.1  ".to_string()),
+            api_version: Some(" 1.47 ".to_string()),
+            ..Default::default()
+        };
+        let mapped = map_version(&version).expect("a reported version maps");
+        assert_eq!(mapped.version, "27.3.1");
+        assert_eq!(mapped.tags, vec!["api 1.47".to_string()]);
+    }
+
+    /// No version from the daemon is `None`, never an empty string: the
+    /// consumer's version slot must stay empty rather than render
+    /// `containers:`.
+    #[test]
+    fn a_silent_daemon_maps_to_no_version() {
+        for silent in [
+            SystemVersion::default(),
+            SystemVersion {
+                version: Some(String::new()),
+                ..Default::default()
+            },
+            SystemVersion {
+                version: Some("   ".to_string()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                map_version(&silent).is_none(),
+                "a daemon that names no version must map to None"
+            );
+        }
     }
 
     #[test]

@@ -349,6 +349,52 @@ pub struct WritableRootfs {
     pub is_direct: bool,
 }
 
+/// A backend's self-reported version, split the way consumers render
+/// `产品名:产品版本` (the admin dependency panel's row shape): the product's
+/// OWN version, plus qualifiers that ride AFTER it as tags — a docker
+/// daemon's API version, say. The split matters: a qualifier in the
+/// version slot reads as part of the product version, which is exactly the
+/// illusion that shape exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerVersion {
+    /// The backend's own version as it reported it: nothing rewritten and
+    /// never composed from other fields. `ContainerVersion::new` trims it;
+    /// a struct literal or `Deserialize` bypasses that trim.
+    pub version: String,
+    /// Qualifiers rendered after the version (`api 1.47`). Empty when the
+    /// backend has none to add.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+impl ContainerVersion {
+    /// A version with no qualifiers, trimmed.
+    ///
+    /// The trim is a PRODUCER obligation this constructor performs, not a
+    /// type-wide invariant: a struct literal and `Deserialize` both bypass
+    /// it. Producers trim here or in their own mapping code (`map_version`
+    /// does); a consumer that needs the guarantee on untrusted input trims
+    /// at the edge.
+    pub fn new(version: impl Into<String>) -> Self {
+        Self {
+            version: version.into().trim().to_string(),
+            tags: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn new_trims_and_adds_no_qualifiers() {
+        let version = ContainerVersion::new("  27.3.1  ");
+        assert_eq!(version.version, "27.3.1");
+        assert!(version.tags.is_empty());
+    }
+}
+
 /// The daemon's own accounting of the bytes it keeps under its storage
 /// root (`GET /system/df`), summed into fixed buckets. This is the
 /// authoritative figure for a data-root the caller cannot traverse

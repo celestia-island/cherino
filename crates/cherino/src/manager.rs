@@ -343,6 +343,20 @@ impl super::ops::ContainerOps for ContainerManager {
         self.disk_usage().await
     }
 
+    async fn version(&self) -> ContainerResult<Option<super::types::ContainerVersion>> {
+        // Delegation, not recursion: inherent methods win resolution inside
+        // their own trait impl, so this reaches `ContainerManager::version`.
+        // The NAME is load-bearing: rename that inherent method away and this
+        // line starts calling THIS function — which still compiles (the
+        // `#[async_trait]` body is a boxed future) and then self-recurses to a
+        // stack overflow. Pinned three times: by the ignored live-daemon test
+        // (`test_daemon_version`) and by two hermetic tests below —
+        // `daemon_version_through_dyn` (a fake `/version` over a temp unix
+        // socket) and `a_daemon_that_hangs_up_is_an_error_not_a_silent_none`
+        // (a daemon that accepts and drops the connection).
+        self.version().await
+    }
+
     async fn logs(&self, container_id: &str, tail: usize) -> ContainerResult<Vec<String>> {
         self.logs(container_id, tail).await
     }
@@ -451,12 +465,173 @@ impl super::ops::ContainerOps for ContainerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ContainerOps;
     use anyhow::Result;
 
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn test_connect_to_docker() -> Result<()> {
         ContainerManager::new()?;
+        Ok(())
+    }
+
+    /// The hermetic half of the same contract, and one of two EXECUTED pins on
+    /// the `impl ContainerOps` delegation arm above (the sibling is
+    /// `a_daemon_that_hangs_up_is_an_error_not_a_silent_none`, which also calls
+    /// the trait object and also dies of a stack overflow if the inherent
+    /// method is renamed): a throwaway unix socket
+    /// answers one `GET /version`, so the real bollard client, the real
+    /// `ContainerManager`, the trait object and `map_version` all run
+    /// without a daemon. Rename the inherent `version()` away and this
+    /// self-recurses to a stack overflow instead of failing politely.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_version_through_dyn() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock).expect("bind the fake daemon");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        // Bounded so a regression that stops issuing the call fails the
+        // assertion below instead of wedging the suite on `accept()`.
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        conn.set_read_timeout(Some(Duration::from_secs(5)))
+                            .expect("read timeout");
+                        let mut buf = [0u8; 4096];
+                        let _ = conn.read(&mut buf);
+                        let body = r#"{"Version":"27.3.1","ApiVersion":"1.47"}"#;
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let answer = format!("{head}{body}");
+                        let _ = conn.write_all(answer.as_bytes());
+                        return;
+                    }
+                    Err(kind) if kind.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let docker = bollard::Docker::connect_with_socket(
+            sock.to_str().expect("socket path is utf-8"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("connect to the fake daemon");
+        let manager = ContainerManager::from_docker(docker);
+
+        // Through the trait object: that is the seam the consumer uses.
+        let ops: &dyn ContainerOps = &manager;
+        let version = ops
+            .version()
+            .await
+            .expect("the fake daemon answers")
+            .expect("the fake daemon reports a version");
+        handle.join().expect("fake daemon thread");
+
+        assert_eq!(version.version, "27.3.1");
+        assert_eq!(version.tags, vec!["api 1.47".to_string()]);
+    }
+
+    /// The error half of the same seam: a daemon that ACCEPTS the connection
+    /// and then hangs up without answering has not told us it has no version
+    /// — it failed. The trait doc promises consumers can tell "no version"
+    /// (`Ok(None)`) from "could not read one" (`Err`), and this is the only
+    /// test that walks the second path without a daemon.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_that_hangs_up_is_an_error_not_a_silent_none() {
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock).expect("bind the fake daemon");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    // Hang up without a byte of response. One is enough: a
+                    // retry finds the listener gone and fails at connect.
+                    Ok((conn, _)) => {
+                        drop(conn);
+                        return;
+                    }
+                    Err(kind) if kind.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let docker = bollard::Docker::connect_with_socket(
+            sock.to_str().expect("socket path is utf-8"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("connect to the fake daemon");
+        let manager = ContainerManager::from_docker(docker);
+        let ops: &dyn ContainerOps = &manager;
+        let outcome = ops.version().await;
+        handle.join().expect("fake daemon thread");
+
+        let error = outcome.expect_err("a daemon that never answers is not 'no version'");
+        assert!(
+            matches!(error, ContainerError::DockerApi(_)),
+            "the failure must stay attributable to the daemon: {error:?}"
+        );
+    }
+
+    /// The live half of the `/version` contract: a real daemon names its
+    /// own version, and the qualifier rides in tags rather than the version
+    /// slot. Ignored by default — no daemon inside the test lane.
+    ///
+    /// It calls through `&dyn ContainerOps` on purpose: that is the seam
+    /// the consumer (scepter's `containers` row) uses, and together with the
+    /// hermetic `daemon_version_through_dyn` above it pins the delegation
+    /// arm — calling the inherent method would keep passing if the trait impl
+    /// ever stopped forwarding.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn test_daemon_version() -> Result<()> {
+        let mgr = ContainerManager::new()?;
+        let ops: &dyn ContainerOps = &mgr;
+        let version = ops
+            .version()
+            .await?
+            .expect("a live daemon reports a version");
+        assert!(!version.version.trim().is_empty(), "version slot is empty");
+        assert!(
+            version.tags.len() <= 1,
+            "at most the API version rides in tags: {:?}",
+            version.tags
+        );
+        assert!(
+            version.tags.iter().all(|tag| tag.starts_with("api ")),
+            "unexpected tags: {:?}",
+            version.tags
+        );
         Ok(())
     }
 

@@ -368,12 +368,26 @@ pub struct ContainerVersion {
 }
 
 impl ContainerVersion {
-    /// A version with no qualifiers.
+    /// A version with no qualifiers. Surrounding whitespace is trimmed here
+    /// rather than left to each producer, so the field's "as reported,
+    /// trimmed" contract holds for every construction path.
     pub fn new(version: impl Into<String>) -> Self {
         Self {
-            version: version.into(),
+            version: version.into().trim().to_string(),
             tags: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn new_trims_and_adds_no_qualifiers() {
+        let version = ContainerVersion::new("  27.3.1  ");
+        assert_eq!(version.version, "27.3.1");
+        assert!(version.tags.is_empty());
     }
 }
 

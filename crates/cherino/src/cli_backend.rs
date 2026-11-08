@@ -166,7 +166,9 @@ impl CliContainerBackend {
     /// Search PATH for the first candidate binary that exists.
     fn resolve_binary(candidates: &[&'static str]) -> Option<PathBuf> {
         for &name in candidates {
-            // Use `Command` to probe — if the binary is absent the spawn fails fast.
+            // PATH lookup only: `find_in_path` tests for an existing,
+            // executable file. Nothing is spawned — a `--version` probe is
+            // not run at construction time.
             if let Some(path) = find_in_path(name) {
                 return Some(path);
             }

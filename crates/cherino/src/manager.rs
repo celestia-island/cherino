@@ -455,6 +455,7 @@ impl super::ops::ContainerOps for ContainerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ContainerOps;
     use anyhow::Result;
 
     #[tokio::test]
@@ -467,15 +468,26 @@ mod tests {
     /// The live half of the `/version` contract: a real daemon names its
     /// own version, and the qualifier rides in tags rather than the version
     /// slot. Ignored by default — no daemon inside the test lane.
+    ///
+    /// It calls through `&dyn ContainerOps` on purpose: that is the seam
+    /// the consumer (scepter's `containers` row) uses, and it is the only
+    /// thing that pins the delegation arm — calling the inherent method
+    /// would keep passing if the trait impl ever stopped forwarding.
     #[tokio::test]
     #[ignore = "requires Docker daemon"]
     async fn test_daemon_version() -> Result<()> {
         let mgr = ContainerManager::new()?;
-        let version = mgr
+        let ops: &dyn ContainerOps = &mgr;
+        let version = ops
             .version()
             .await?
             .expect("a live daemon reports a version");
         assert!(!version.version.trim().is_empty(), "version slot is empty");
+        assert!(
+            version.tags.len() <= 1,
+            "at most the API version rides in tags: {:?}",
+            version.tags
+        );
         assert!(
             version.tags.iter().all(|tag| tag.starts_with("api ")),
             "unexpected tags: {:?}",

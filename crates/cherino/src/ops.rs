@@ -101,10 +101,10 @@ pub trait ContainerOps: Send + Sync {
     /// but fails to (daemon down, permission denied) still returns an error —
     /// the difference between "no version" and "could not read one" is what
     /// consumers log. One corner is deliberately NOT an error: a backend that
-    /// answers but carries no version in its answer (a 200 payload without
-    /// the field, a CLI printing something unparseable) reports `Ok(None)` —
-    /// the row degrades to the bare product name, where an `Err` would log a
-    /// probe failure for a backend that is answering fine.
+    /// answers but carries no version in its answer (a 200 payload whose
+    /// version field is absent or blank) reports `Ok(None)` — the row
+    /// degrades to the bare product name, where an `Err` would log a probe
+    /// failure for a backend that is answering fine.
     async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
         Ok(None)
     }

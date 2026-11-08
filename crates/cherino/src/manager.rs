@@ -343,6 +343,10 @@ impl super::ops::ContainerOps for ContainerManager {
         self.disk_usage().await
     }
 
+    async fn version(&self) -> ContainerResult<Option<super::types::ContainerVersion>> {
+        self.version().await
+    }
+
     async fn logs(&self, container_id: &str, tail: usize) -> ContainerResult<Vec<String>> {
         self.logs(container_id, tail).await
     }
@@ -457,6 +461,26 @@ mod tests {
     #[ignore = "requires Docker daemon"]
     async fn test_connect_to_docker() -> Result<()> {
         ContainerManager::new()?;
+        Ok(())
+    }
+
+    /// The live half of the `/version` contract: a real daemon names its
+    /// own version, and the qualifier rides in tags rather than the version
+    /// slot. Ignored by default — no daemon inside the test lane.
+    #[tokio::test]
+    #[ignore = "requires Docker daemon"]
+    async fn test_daemon_version() -> Result<()> {
+        let mgr = ContainerManager::new()?;
+        let version = mgr
+            .version()
+            .await?
+            .expect("a live daemon reports a version");
+        assert!(!version.version.trim().is_empty(), "version slot is empty");
+        assert!(
+            version.tags.iter().all(|tag| tag.starts_with("api ")),
+            "unexpected tags: {:?}",
+            version.tags
+        );
         Ok(())
     }
 

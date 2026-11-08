@@ -349,6 +349,33 @@ pub struct WritableRootfs {
     pub is_direct: bool,
 }
 
+/// A backend's self-reported version, split the way consumers render
+/// `产品名:产品版本` (the admin dependency panel's row shape): the product's
+/// OWN version, plus qualifiers that ride AFTER it as tags — a docker
+/// daemon's API version, say. The split matters: a qualifier in the
+/// version slot reads as part of the product version, which is exactly the
+/// illusion that shape exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerVersion {
+    /// The backend's own version, verbatim from the backend (never
+    /// reformatted, never composed from other fields).
+    pub version: String,
+    /// Qualifiers rendered after the version (`api 1.47`). Empty when the
+    /// backend has none to add.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+impl ContainerVersion {
+    /// A version with no qualifiers.
+    pub fn new(version: impl Into<String>) -> Self {
+        Self {
+            version: version.into(),
+            tags: Vec::new(),
+        }
+    }
+}
+
 /// The daemon's own accounting of the bytes it keeps under its storage
 /// root (`GET /system/df`), summed into fixed buckets. This is the
 /// authoritative figure for a data-root the caller cannot traverse

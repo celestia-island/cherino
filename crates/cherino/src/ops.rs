@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use super::{
     errors::{ContainerError, ContainerResult},
     types::{
-        ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo, ExecOutput,
-        ImageInfo, PathChange, WritableRootfs,
+        ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo,
+        ContainerVersion, ExecOutput, ImageInfo, PathChange, WritableRootfs,
     },
 };
 
@@ -86,6 +86,24 @@ pub trait ContainerOps: Send + Sync {
     async fn remove_volume(&self, name: &str, force: bool) -> ContainerResult<()>;
     async fn volume_exists(&self, name: &str) -> ContainerResult<bool>;
     async fn list_volumes(&self) -> ContainerResult<Vec<super::types::DockerVolumeInfo>>;
+
+    // -- Identity --
+
+    /// The backend's SELF-REPORTED version, split the way consumers render
+    /// `产品名:产品版本`: the product's own version plus qualifiers that ride
+    /// after it as tags (a docker daemon's API version, say).
+    ///
+    /// Default: `Ok(None)` — "this backend cannot name its version". That is
+    /// deliberately NOT [`ContainerError::UnsupportedBackend`] the way
+    /// [`Self::storage_root`] is: a version nobody can name is simply
+    /// unnameable (the consumer renders the bare product name), while a
+    /// fabricated storage path would be dangerous. A backend that CAN answer
+    /// but fails to (daemon down, permission denied) still returns an error —
+    /// the difference between "no version" and "could not read one" is what
+    /// consumers log.
+    async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
+        Ok(None)
+    }
 
     // -- Storage Topology --
 
@@ -254,6 +272,20 @@ mod tests {
             matches!(err, ContainerError::UnsupportedBackend(_)),
             "unexpected error shape: {err}"
         );
+    }
+
+    /// The version default arm is the third kind of "no fabricated
+    /// answers": a backend that cannot name itself renders the bare
+    /// product name, and `Ok(None)` is how it says so — never a
+    /// placeholder version, never an error a consumer would log as a probe
+    /// failure.
+    #[tokio::test]
+    async fn version_defaults_to_none() {
+        let version = NullBackend
+            .version()
+            .await
+            .expect("an unnameable version is not an error");
+        assert!(version.is_none(), "no backend may inherit a version");
     }
 
     /// The docker_disk_usage default arm is the "no fabricated numbers"

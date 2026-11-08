@@ -346,11 +346,12 @@ impl super::ops::ContainerOps for ContainerManager {
     async fn version(&self) -> ContainerResult<Option<super::types::ContainerVersion>> {
         // Delegation, not recursion: inherent methods win resolution inside
         // their own trait impl, so this reaches `ContainerManager::version`.
-        // If that inherent method is ever renamed away this line starts
-        // calling THIS function — which still compiles and then hangs — so
-        // the name is load-bearing. Pinned by the ignored live-daemon test
-        // (`test_daemon_version`, through `&dyn ContainerOps`); no hermetic
-        // test can reach a body that needs a Docker socket.
+        // The NAME is load-bearing: rename that inherent method away and this
+        // line starts calling THIS function — which still compiles (the
+        // `#[async_trait]` body is a boxed future) and then self-recurses to a
+        // stack overflow. Pinned twice: by the ignored live-daemon test
+        // (`test_daemon_version`) and by `daemon_version_through_dyn` below,
+        // which serves a fake `/version` over a temp unix socket.
         self.version().await
     }
 
@@ -470,6 +471,76 @@ mod tests {
     async fn test_connect_to_docker() -> Result<()> {
         ContainerManager::new()?;
         Ok(())
+    }
+
+    /// The hermetic half of the same contract, and the only EXECUTED pin on
+    /// the `impl ContainerOps` delegation arm above: a throwaway unix socket
+    /// answers one `GET /version`, so the real bollard client, the real
+    /// `ContainerManager`, the trait object and `map_version` all run
+    /// without a daemon. Rename the inherent `version()` away and this
+    /// self-recurses to a stack overflow instead of failing politely.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_version_through_dyn() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock).expect("bind the fake daemon");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        // Bounded so a regression that stops issuing the call fails the
+        // assertion below instead of wedging the suite on `accept()`.
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        conn.set_read_timeout(Some(Duration::from_secs(5)))
+                            .expect("read timeout");
+                        let mut buf = [0u8; 4096];
+                        let _ = conn.read(&mut buf);
+                        let body = r#"{"Version":"27.3.1","ApiVersion":"1.47"}"#;
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let answer = format!("{head}{body}");
+                        let _ = conn.write_all(answer.as_bytes());
+                        return;
+                    }
+                    Err(kind) if kind.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let docker = bollard::Docker::connect_with_socket(
+            sock.to_str().expect("socket path is utf-8"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("connect to the fake daemon");
+        let manager = ContainerManager::from_docker(docker);
+
+        // Through the trait object: that is the seam the consumer uses.
+        let ops: &dyn ContainerOps = &manager;
+        let version = ops
+            .version()
+            .await
+            .expect("the fake daemon answers")
+            .expect("the fake daemon reports a version");
+        handle.join().expect("fake daemon thread");
+
+        assert_eq!(version.version, "27.3.1");
+        assert_eq!(version.tags, vec!["api 1.47".to_string()]);
     }
 
     /// The live half of the `/version` contract: a real daemon names its

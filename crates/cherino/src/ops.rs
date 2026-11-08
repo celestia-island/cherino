@@ -105,6 +105,13 @@ pub trait ContainerOps: Send + Sync {
     /// version field is absent or blank) reports `Ok(None)` — the row
     /// degrades to the bare product name, where an `Err` would log a probe
     /// failure for a backend that is answering fine.
+    ///
+    /// Presence is therefore PLATFORM- and arm-dependent, not type-wide: the
+    /// Linux youki backend answers, its non-Linux stub (`cherino-runtime`)
+    /// inherits the default and stays silent, and both docker and the CLI
+    /// adapters can be either depending on what is installed. Consumers must
+    /// treat `None` as "not named here", never as "this platform has no
+    /// containers".
     async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
         Ok(None)
     }

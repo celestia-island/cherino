@@ -194,6 +194,21 @@ mod tests {
         assert!(map_version(&blank).expect("maps").tags.is_empty());
     }
 
+    /// Both slots are trimmed before they reach a consumer: a daemon (or a
+    /// proxy rewriting its answer) that pads the field must still render as
+    /// `containers:27.3.1 api 1.47`, not with the padding visible.
+    #[test]
+    fn padded_version_and_api_version_are_trimmed() {
+        let version = SystemVersion {
+            version: Some("  27.3.1  ".to_string()),
+            api_version: Some(" 1.47 ".to_string()),
+            ..Default::default()
+        };
+        let mapped = map_version(&version).expect("a reported version maps");
+        assert_eq!(mapped.version, "27.3.1");
+        assert_eq!(mapped.tags, vec!["api 1.47".to_string()]);
+    }
+
     /// No version from the daemon is `None`, never an empty string: the
     /// consumer's version slot must stay empty rather than render
     /// `containers:`.

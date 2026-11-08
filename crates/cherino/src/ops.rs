@@ -100,7 +100,11 @@ pub trait ContainerOps: Send + Sync {
     /// fabricated storage path would be dangerous. A backend that CAN answer
     /// but fails to (daemon down, permission denied) still returns an error —
     /// the difference between "no version" and "could not read one" is what
-    /// consumers log.
+    /// consumers log. One corner is deliberately NOT an error: a backend that
+    /// answers but carries no version in its answer (a 200 payload without
+    /// the field, a CLI printing something unparseable) reports `Ok(None)` —
+    /// the row degrades to the bare product name, where an `Err` would log a
+    /// probe failure for a backend that is answering fine.
     async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
         Ok(None)
     }
@@ -208,9 +212,10 @@ mod tests {
 
     /// A backend that implements NOTHING: every trait method inherits its
     /// default or errors out. Its only job is pinning default-method arms
-    /// (storage_root, docker_disk_usage) so the trait contract stays
-    /// explicit — a backend that never opted in must surface Unsupported,
-    /// never a path or number a hygiene consumer could mistake for usable.
+    /// (storage_root, docker_disk_usage) and the version default (version →
+    /// `None`) so the trait contract stays explicit — a backend that never
+    /// opted in must surface Unsupported or "cannot name itself", never a
+    /// path, number or version string a consumer could mistake for real.
     #[derive(Debug, Clone, Copy, Default)]
     struct NullBackend;
 

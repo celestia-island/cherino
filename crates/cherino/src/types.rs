@@ -357,8 +357,9 @@ pub struct WritableRootfs {
 /// illusion that shape exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerVersion {
-    /// The backend's own version, verbatim from the backend (never
-    /// reformatted, never composed from other fields).
+    /// The backend's own version as it reported it — surrounding
+    /// whitespace trimmed, nothing else rewritten or composed from other
+    /// fields.
     pub version: String,
     /// Qualifiers rendered after the version (`api 1.47`). Empty when the
     /// backend has none to add.

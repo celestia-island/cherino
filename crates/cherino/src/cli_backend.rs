@@ -94,6 +94,11 @@ impl CliProfile {
 ///
 /// Constructed via [`CliContainerBackend::new`] with a [`ContainerRuntimeType`].
 /// Resolves the binary on PATH at construction time.
+///
+/// `ContainerOps::version` is NOT overridden here on purpose: the two CLIs
+/// disagree about how they report a version, and neither can be exercised on
+/// the platforms this crate builds for in CI — a wrong guess would be worse
+/// than the honest default (`Ok(None)`), which renders the bare product name.
 pub struct CliContainerBackend {
     profile: CliProfile,
     binary_path: PathBuf,
@@ -103,7 +108,8 @@ pub struct CliContainerBackend {
 impl CliContainerBackend {
     /// Create a CLI backend for the given runtime type.
     ///
-    /// Resolves the CLI binary on PATH and probes it with `--version`.
+    /// Resolves the CLI binary on PATH (existence of the executable, not a
+    /// `--version` probe — nothing is spawned here).
     pub fn new(runtime: ContainerRuntimeType) -> ContainerResult<Self> {
         let profile = Self::profile_for(runtime)?;
         let binary_candidates = Self::binary_candidates(&profile, runtime);

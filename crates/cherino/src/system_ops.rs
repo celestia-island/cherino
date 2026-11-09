@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::{
     errors::{ContainerError, ContainerResult},
@@ -7,6 +8,26 @@ use super::{
 };
 
 use bollard::models::{SystemInfo, SystemVersion};
+
+/// The per-call bound for the daemon version read. Generous enough for a
+/// busy daemon's cold cache, well inside any caller's own row window.
+pub const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET /version` under a per-call bound; the timeout is a parameter so
+/// tests can pin the bound against a silent daemon without waiting out
+/// the production constant. Extracted as a free function over `&Docker`
+/// so the test drives the PRODUCTION path, not a copy of it.
+pub(crate) async fn version_with_timeout(
+    docker: &bollard::Docker,
+    timeout: Duration,
+) -> ContainerResult<Option<ContainerVersion>> {
+    let version = tokio::time::timeout(timeout, docker.version())
+        .await
+        .map_err(|_| {
+            ContainerError::Connection(format!("daemon version read timed out after {timeout:?}"))
+        })??;
+    Ok(map_version(&version))
+}
 
 /// Map a daemon `/info` payload to the storage root. A daemon that omits
 /// `DockerRootDir` — or reports it empty (defensive: the API allows an
@@ -95,9 +116,17 @@ impl ContainerManager {
     /// The daemon's own version (`GET /version`), split into the product
     /// version and its qualifiers — the `containers` dependency row's
     /// `产品名:产品版本` identity.
+    ///
+    /// The read carries a per-call bound (`VERSION_TIMEOUT`): the other
+    /// daemon reads here (`storage_root`, `docker_disk_usage`) are also
+    /// unbounded, but those callers own a timeout of their own, while the
+    /// version read feeds a probe row whose entire allowance is a few
+    /// seconds — an unbounded leg there would let a wedged daemon hold a
+    /// whole health answer hostage. A timed-out read is a transport
+    /// failure (`Connection`), never a silent `None`: "answered but
+    /// failed" stays an error by the same contract as every other read.
     pub async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
-        let version = self.docker.version().await?;
-        Ok(map_version(&version))
+        version_with_timeout(&self.docker, self.version_bound).await
     }
 
     /// The dockerd data-root (`DockerRootDir` from `/info` — overlay2,

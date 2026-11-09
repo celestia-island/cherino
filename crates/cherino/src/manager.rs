@@ -15,6 +15,12 @@ pub struct ContainerManager {
     pub(crate) docker: Docker,
     pub(crate) state: Arc<RwLock<HashMap<String, ContainerInfo>>>,
     pub(crate) event_tx: broadcast::Sender<ContainerEvent>,
+    /// The per-call bound the version read carries (`VERSION_TIMEOUT`).
+    /// A field, not a bare constant at the call site, so a TEST can drive
+    /// the production `version()` path — trait arm, delegation, timeout
+    /// and all — against a silent daemon without paying the real 5 s.
+    /// Producers never touch it; `from_docker` pins the default.
+    pub(crate) version_bound: std::time::Duration,
 }
 
 impl ContainerManager {
@@ -27,6 +33,7 @@ impl ContainerManager {
             docker,
             state: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            version_bound: super::system_ops::VERSION_TIMEOUT,
         })
     }
 
@@ -39,6 +46,7 @@ impl ContainerManager {
             docker,
             state: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            version_bound: super::system_ops::VERSION_TIMEOUT,
         })
     }
 
@@ -48,7 +56,19 @@ impl ContainerManager {
             docker,
             state: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            version_bound: super::system_ops::VERSION_TIMEOUT,
         }
+    }
+
+    /// Test-only override of the version bound. The production value stays
+    /// `VERSION_TIMEOUT`; this exists so the bound test can drive the REAL
+    /// `version()` path (trait arm → delegation → timeout) against a
+    /// silent daemon in 200 ms instead of 5 s — without it, the delegation
+    /// could be deleted and every hermetic suite would stay green.
+    #[cfg(test)]
+    pub(crate) fn with_version_bound(mut self, bound: std::time::Duration) -> Self {
+        self.version_bound = bound;
+        self
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ContainerEvent> {
@@ -600,6 +620,143 @@ mod tests {
         assert!(
             matches!(error, ContainerError::DockerApi(_)),
             "the failure must stay attributable to the daemon: {error:?}"
+        );
+    }
+
+    /// The bound, pinned on the PRODUCTION path: the trait arm, the
+    /// delegation to the inherent method and the timeout wrap all run here
+    /// (the sibling test drives `version_with_timeout` directly, which
+    /// leaves this delegation free to be deleted — two independent rounds
+    /// both mutated it away with the whole suite staying green). The
+    /// daemon holds the connection past the test's bound, so the ONLY way
+    /// this passes is the bound firing through the real call chain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_manager_version_call_is_bounded_by_its_own_wiring() {
+        use std::io::{ErrorKind, Read};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        assert_eq!(
+            crate::system_ops::VERSION_TIMEOUT,
+            Duration::from_secs(5),
+            "the committed production bound — a change here is a release-note fact"
+        );
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock).expect("bind the fake daemon");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        let mut buf = [0u8; 1024];
+                        let _ = conn.read(&mut buf);
+                        std::thread::sleep(Duration::from_millis(1200));
+                        return;
+                    }
+                    Err(kind) if kind.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let docker = bollard::Docker::connect_with_socket(
+            sock.to_str().expect("socket path is utf-8"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("connect to the fake daemon");
+        let manager =
+            ContainerManager::from_docker(docker).with_version_bound(Duration::from_millis(200));
+        let ops: &dyn ContainerOps = &manager;
+        let started = Instant::now();
+        let outcome = ops.version().await;
+        handle.join().expect("fake daemon thread");
+
+        let error = outcome.expect_err("a daemon that never answers is not 'no version'");
+        assert!(
+            matches!(error, ContainerError::Connection(_)),
+            "the production chain must surface the bound as a transport failure: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wiring must actually bound the read: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The bound half of the same seam: a daemon that ACCEPTS the version
+    /// call and then never answers must fail WITHIN the caller's budget, not
+    /// hold it open — the consumer (scepter's containers row) has a few
+    /// seconds for the whole four-row answer. Driven through the production
+    /// `version_with_timeout` with a short bound; the fake daemon holds the
+    /// connection open past that bound, so the ONLY way this test passes is
+    /// the timeout firing (a silent `None`, or a pass-through error, both
+    /// fail it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_version_read_is_bounded_not_unbounded() {
+        use std::io::{ErrorKind, Read};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock).expect("bind the fake daemon");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    // Hold the connection open past the test's bound: reading
+                    // the request and then sitting on the socket is what a
+                    // wedged daemon looks like from the client side.
+                    Ok((mut conn, _)) => {
+                        let mut buf = [0u8; 1024];
+                        let _ = conn.read(&mut buf);
+                        std::thread::sleep(Duration::from_millis(1200));
+                        return;
+                    }
+                    Err(kind) if kind.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let docker = bollard::Docker::connect_with_socket(
+            sock.to_str().expect("socket path is utf-8"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("connect to the fake daemon");
+
+        let started = Instant::now();
+        let outcome =
+            crate::system_ops::version_with_timeout(&docker, Duration::from_millis(200)).await;
+        handle.join().expect("fake daemon thread");
+
+        let error = outcome.expect_err("a daemon that never answers is not 'no version'");
+        assert!(
+            matches!(error, ContainerError::Connection(_)),
+            "a timed-out read is a transport failure, not a silent none: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the bound must actually bound: took {:?}",
+            started.elapsed()
         );
     }
 

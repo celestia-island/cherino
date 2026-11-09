@@ -1476,6 +1476,27 @@ mod tests {
     }
 
     #[test]
+    fn first_shaped_token_wins_even_when_a_later_one_exists() {
+        // Round B's M1 survivor: "first version-shaped token" (within a
+        // line and across lines) was unpinned — with one shaped token per
+        // test line, first==last silently. A line carrying TWO shaped
+        // tokens pins the scan order.
+        assert_eq!(
+            parse_cli_version("mytool version 1.2.3 build 2024.01\n"),
+            Some("1.2.3".to_string())
+        );
+    }
+
+    #[test]
+    fn dotted_non_digit_major_is_not_a_version() {
+        // Round B's M2 survivor: the digit-led-major gate was unobserved
+        // (every failing test input was dot-less, rejected by the
+        // structure before the digit check could matter).
+        assert_eq!(parse_cli_version("tool rc.1\n"), None);
+        assert_eq!(parse_cli_version("tool v.1.0\n"), None);
+    }
+
+    #[test]
     fn unparsable_output_maps_to_none_not_a_guess() {
         assert_eq!(parse_cli_version(""), None);
         assert_eq!(parse_cli_version("\n\n"), None);

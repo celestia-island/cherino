@@ -126,7 +126,7 @@ impl ContainerManager {
     /// failure (`Connection`), never a silent `None`: "answered but
     /// failed" stays an error by the same contract as every other read.
     pub async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
-        version_with_timeout(&self.docker, VERSION_TIMEOUT).await
+        version_with_timeout(&self.docker, self.version_bound).await
     }
 
     /// The dockerd data-root (`DockerRootDir` from `/info` — overlay2,

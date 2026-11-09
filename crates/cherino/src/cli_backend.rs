@@ -87,6 +87,80 @@ impl CliProfile {
 }
 
 // ---------------------------------------------------------------------------
+// Version probe
+// ---------------------------------------------------------------------------
+
+/// True when the token reads as a version: digit-led with at least one
+/// dot separating two digit groups (`1.2.3`, `0.1.0`, `26.1`), tolerating
+/// a suffix (`-rc.1`, `+build`). Words, dates without dots and bare
+/// integers all fail the shape — the probe would rather report nothing
+/// than half of a sentence.
+fn looks_like_version(token: &str) -> bool {
+    let core = token.split(['-', '+']).next().unwrap_or(token);
+    let mut groups = core.split('.');
+    let (Some(major), Some(minor)) = (groups.next(), groups.next()) else {
+        return false;
+    };
+    !major.is_empty()
+        && major.chars().all(|c| c.is_ascii_digit())
+        && !minor.is_empty()
+        && minor.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Extract the product version from a CLI `--version` output. Lines are
+/// scanned in order and the first line carrying a version-shaped token
+/// wins — Apple Container phrases `container version 0.1.0`, WSLc has its
+/// own phrasing, and banners may precede either, so the parser skips
+/// version-less lines instead of hard-coding a layout. Whatever the CLI
+/// says, the honest fallback is `None` (bare product name), never a
+/// misparsed word.
+fn parse_cli_version(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.split_whitespace().find(|t| looks_like_version(t)))
+        .map(str::to_string)
+}
+
+/// Run the `--version` probe under a per-call bound. Spawn failures,
+/// non-zero exits and timeouts are transport failures (`Connection`) —
+/// "the CLI answered and failed" must never masquerade as "unnamed";
+/// only a successful run without a parseable version maps to `None`.
+async fn probe_version(mut cmd: Command, timeout: Duration) -> ContainerResult<Option<String>> {
+    let output = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| {
+            ContainerError::Connection(format!("CLI version probe timed out after {timeout:?}"))
+        })?
+        .map_err(|e| {
+            ContainerError::Connection(format!("CLI version probe failed to spawn: {e}"))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        // Tail only: a wedged CLI can pour garbage into stderr.
+        let tail: String = {
+            let mut chars: Vec<char> = detail.chars().collect();
+            if chars.len() > 200 {
+                chars = chars.split_off(chars.len() - 200);
+            }
+            chars.into_iter().collect()
+        };
+        return Err(ContainerError::Connection(format!(
+            "CLI version probe exited {:?}: {tail}",
+            output.status.code()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(parse_cli_version(&stdout))
+}
+
+// ---------------------------------------------------------------------------
 // Backend
 // ---------------------------------------------------------------------------
 
@@ -95,10 +169,18 @@ impl CliProfile {
 /// Constructed via [`CliContainerBackend::new`] with a [`ContainerRuntimeType`].
 /// Resolves the binary on PATH at construction time.
 ///
-/// `ContainerOps::version` is NOT overridden here on purpose: the two CLIs
-/// disagree about how they report a version, and neither can be exercised on
-/// the platforms this crate builds for in CI — a wrong guess would be worse
-/// than the honest default (`Ok(None)`), which renders the bare product name.
+/// `ContainerOps::version` IS overridden here: the probe spawns
+/// `<binary> --version` under the shared [`crate::system_ops::VERSION_TIMEOUT`]
+/// bound and parses a version-shaped token out of the output. The two CLIs
+/// phrase their output differently, so the parser is deliberately defensive —
+/// it scans for the first digit-led, dot-separated token rather than
+/// hard-coding one format, and an output it cannot understand maps to
+/// `Ok(None)` (the bare product name, exactly today's rendering) instead of a
+/// guess. Transport failures — spawn error, non-zero exit, timeout — stay
+/// errors (`Connection`), by the same "answered but failed is an error"
+/// contract as the Docker arm; nothing here can be exercised on the platforms
+/// CI builds for, which is why every shape is pinned through the pure parser
+/// and a `/bin/sh` stand-in for the binary.
 pub struct CliContainerBackend {
     profile: CliProfile,
     binary_path: PathBuf,
@@ -361,6 +443,20 @@ impl CliContainerBackend {
 
 #[async_trait]
 impl ContainerOps for CliContainerBackend {
+    // -- Version --
+
+    /// `<binary> --version` under the shared probe bound, parsed into the
+    /// product version. Transport failures surface as `Connection`; an
+    /// output without a recognizable version token stays `Ok(None)` —
+    /// the row renders the bare product name rather than a guessed or
+    /// broken identity.
+    async fn version(&self) -> ContainerResult<Option<crate::types::ContainerVersion>> {
+        let mut cmd = Command::new(&self.binary_path);
+        cmd.arg("--version");
+        let parsed = probe_version(cmd, crate::system_ops::VERSION_TIMEOUT).await?;
+        Ok(parsed.map(crate::types::ContainerVersion::new))
+    }
+
     // -- Lifecycle --
 
     async fn create(&self, params: &ContainerCreateParams) -> ContainerResult<ContainerInfo> {
@@ -1342,6 +1438,104 @@ fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::types::{PortMapping, VolumeMount};
+
+    // -- version probe: the pure parser (every output shape the two CLIs
+    //    might produce, pinned through the PRODUCTION function) --
+
+    #[test]
+    fn apple_container_phrasing_parses_the_version_token() {
+        assert_eq!(
+            parse_cli_version("container version 0.1.0\n"),
+            Some("0.1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn wslc_style_phrasing_parses_the_version_token() {
+        assert_eq!(
+            parse_cli_version("wslc version 1.2.5 (build: 2024.01)\n"),
+            Some("1.2.5".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_version_line_parses_whole_token_including_prerelease() {
+        assert_eq!(
+            parse_cli_version("0.2.0-rc.1\n"),
+            Some("0.2.0-rc.1".to_string())
+        );
+        assert_eq!(parse_cli_version("26.1\n"), Some("26.1".to_string()));
+    }
+
+    #[test]
+    fn leading_noise_lines_are_skipped_for_the_first_version_line() {
+        assert_eq!(
+            parse_cli_version("some banner\ncontainer version 1.0.0\njunk 99x\n"),
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn unparsable_output_maps_to_none_not_a_guess() {
+        assert_eq!(parse_cli_version(""), None);
+        assert_eq!(parse_cli_version("\n\n"), None);
+        assert_eq!(parse_cli_version("container: no such thing\n"), None);
+        // a bare year has no dot — not a version shape
+        assert_eq!(parse_cli_version("container tools 2024\n"), None);
+    }
+
+    // -- version probe: the spawn path (cfg(unix); /bin/sh stands in for
+    //    the container CLI, which no CI platform provides) --
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_parses_a_successful_cli_answer() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf 'container version 9.9.9\\n'"]);
+        assert_eq!(
+            probe_version(cmd, Duration::from_secs(5))
+                .await
+                .expect("probe succeeds"),
+            Some("9.9.9".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_maps_a_successful_but_unversioned_answer_to_none() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf 'greetings\\n'"]);
+        assert_eq!(
+            probe_version(cmd, Duration::from_secs(5))
+                .await
+                .expect("probe succeeds"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_maps_a_nonzero_exit_to_connection_not_none() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo wedged >&2; exit 3"]);
+        let err = probe_version(cmd, Duration::from_secs(5))
+            .await
+            .expect_err("failed CLI is an error");
+        assert!(matches!(err, ContainerError::Connection(_)), "got: {err}");
+        assert!(err.to_string().contains("exited"), "detail: {err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_maps_a_wedged_cli_to_a_timeout_connection_error() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30"]);
+        let err = probe_version(cmd, Duration::from_millis(80))
+            .await
+            .expect_err("a wedged CLI must time out");
+        assert!(matches!(err, ContainerError::Connection(_)), "got: {err}");
+        assert!(err.to_string().contains("timed out"), "detail: {err}");
+    }
 
     #[test]
     fn test_runtime_type_from_str_new_variants() {

@@ -110,9 +110,9 @@ pub trait ContainerOps: Send + Sync {
     /// Linux youki backend answers; its non-Linux stub (`cherino-runtime`)
     /// inherits the default and stays silent; docker answers when the daemon
     /// reports a version and stays silent when the payload carries none; and
-    /// the CLI adapters inherit the default too, so they never answer.
-    /// Consumers must treat `None` as "not named here", never as "this
-    /// platform has no containers".
+    /// the CLI adapters answer by probing `<binary> --version` (unparsable
+    /// output degrades to the silent default). Consumers must treat `None`
+    /// as "not named here", never as "this platform has no containers".
     async fn version(&self) -> ContainerResult<Option<ContainerVersion>> {
         Ok(None)
     }

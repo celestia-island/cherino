@@ -359,7 +359,11 @@ pub struct WritableRootfs {
 pub struct ContainerVersion {
     /// The backend's own version as it reported it: nothing rewritten and
     /// never composed from other fields. `ContainerVersion::new` trims it;
-    /// a struct literal or `Deserialize` bypasses that trim.
+    /// a struct literal or `Deserialize` bypasses that trim. `default` keeps
+    /// a payload without the field deserializable, mirroring `tags` —
+    /// deserialization is a WIRE contract, and a report that omits the
+    /// version is "not named", not malformed.
+    #[serde(default)]
     pub version: String,
     /// Qualifiers rendered after the version (`api 1.47`). Empty when the
     /// backend has none to add.
@@ -386,6 +390,23 @@ impl ContainerVersion {
 #[cfg(test)]
 mod version_tests {
     use super::*;
+
+    /// Both fields are `#[serde(default)]`: deserialization is a WIRE
+    /// contract, and a payload that omits a field is "not named", never
+    /// malformed. `version` had no default until 0.1.9 — the asymmetry
+    /// against `tags` meant a version-less payload bounced, which no
+    /// producer actually sends but every defensive consumer must survive.
+    #[test]
+    fn a_payload_without_fields_deserializes_empty() {
+        let bare: ContainerVersion = serde_json::from_str("{}").expect("empty payload");
+        assert_eq!(bare.version, "");
+        assert!(bare.tags.is_empty());
+
+        let version_only: ContainerVersion =
+            serde_json::from_str(r#"{"version":"27.3.1"}"#).expect("version-only payload");
+        assert_eq!(version_only.version, "27.3.1");
+        assert!(version_only.tags.is_empty());
+    }
 
     #[test]
     fn new_trims_and_adds_no_qualifiers() {

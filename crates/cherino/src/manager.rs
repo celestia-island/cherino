@@ -603,6 +603,73 @@ mod tests {
         );
     }
 
+    /// The bound half of the same seam: a daemon that ACCEPTS the version
+    /// call and then never answers must fail WITHIN the caller's budget, not
+    /// hold it open — the consumer (scepter's containers row) has a few
+    /// seconds for the whole four-row answer. Driven through the production
+    /// `version_with_timeout` with a short bound; the fake daemon holds the
+    /// connection open past that bound, so the ONLY way this test passes is
+    /// the timeout firing (a silent `None`, or a pass-through error, both
+    /// fail it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_version_read_is_bounded_not_unbounded() {
+        use std::io::{ErrorKind, Read};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sock = dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&sock).expect("bind the fake daemon");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    // Hold the connection open past the test's bound: reading
+                    // the request and then sitting on the socket is what a
+                    // wedged daemon looks like from the client side.
+                    Ok((mut conn, _)) => {
+                        let mut buf = [0u8; 1024];
+                        let _ = conn.read(&mut buf);
+                        std::thread::sleep(Duration::from_millis(1200));
+                        return;
+                    }
+                    Err(kind) if kind.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let docker = bollard::Docker::connect_with_socket(
+            sock.to_str().expect("socket path is utf-8"),
+            5,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("connect to the fake daemon");
+
+        let started = Instant::now();
+        let outcome =
+            crate::system_ops::version_with_timeout(&docker, Duration::from_millis(200)).await;
+        handle.join().expect("fake daemon thread");
+
+        let error = outcome.expect_err("a daemon that never answers is not 'no version'");
+        assert!(
+            matches!(error, ContainerError::Connection(_)),
+            "a timed-out read is a transport failure, not a silent none: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the bound must actually bound: took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// The live half of the `/version` contract: a real daemon names its
     /// own version, and the qualifier rides in tags rather than the version
     /// slot. Ignored by default — no daemon inside the test lane.

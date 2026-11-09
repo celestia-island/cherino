@@ -1548,6 +1548,32 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_garbage_stderr_is_tail_capped_at_two_hundred_chars() {
+        // #40 S3 follow-up, shipped with 0.1.10: a wedged CLI can pour
+        // garbage into stderr — the detail keeps the TAIL (last 200
+        // chars) and drops the head, so the error stays a line, not a
+        // torrent, and the markers prove WHICH side survived.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "printf 'HEAD-MARKER'; printf 'H%.0s' $(seq 1 400); printf 'TAIL-MARKER'; exit 3",
+        ]);
+        let err = probe_version(cmd, Duration::from_secs(5))
+            .await
+            .expect_err("failed CLI is an error");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("TAIL-MARKER"),
+            "the tail survives: {detail}"
+        );
+        assert!(
+            !detail.contains("HEAD-MARKER"),
+            "the head is capped away (200-char tail): {detail}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn probe_maps_a_wedged_cli_to_a_timeout_connection_error() {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "sleep 30"]);

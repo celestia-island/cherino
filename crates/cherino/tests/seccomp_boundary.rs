@@ -10,7 +10,7 @@
 //! | --- | --- | --- |
 //! | `unconfined` | none (the live sandbox before R2) | all allowed |
 //! | `entelecheia_default` | the workload default | all refused ⇒ the reason the gap existed |
-//! | `cosmos` | the new preset | mount/umount2/unshare allowed; ptrace/bpf/process_vm_readv still refused |
+//! | `cosmos` | the new preset | mount/umount2 allowed; unshare/ptrace/bpf/process_vm_readv/new-API still refused |
 //!
 //! The matrix runs with `apparmor=unconfined` so that every observed EPERM can
 //! only come from seccomp: the AppArmor half is a different layer and would
@@ -219,19 +219,20 @@ fn cosmos_seccomp_boundary_matrix() {
     );
     assert_eq!(default["bpf"], EPERM, "the default profile blocks bpf");
 
-    // The new cosmos preset: the FUSE/OCI family becomes reachable, the kernel
-    // attack surface does not.
+    // The new cosmos preset: the FUSE probe's classic mount becomes reachable,
+    // everything else stays shut.
     let cosmos = run_probe(Filter::Profile(SeccompProfile::Cosmos), &image);
-    // Positive control: a normal cosmos workload (the rootfs probe + the inner
-    // OCI runtime) can mount and create a namespace.
+    // Positive control: the rootfs probe can mount and unmount.
     assert_eq!(cosmos["mount"], 0, "cosmos must allow mount: {cosmos:?}");
     assert_eq!(
         cosmos["umount2"], 0,
         "cosmos must allow umount2: {cosmos:?}"
     );
+    // The namespace family left with the inner-OCI half, which this profile does
+    // not support (libcontainer 0.7 mounts only through the fd-based API).
     assert_eq!(
-        cosmos["unshare"], 0,
-        "cosmos must allow unshare: {cosmos:?}"
+        cosmos["unshare"], EPERM,
+        "cosmos must not admit namespace creation: {cosmos:?}"
     );
     // Negative control: the escape surface is still refused.
     assert_eq!(cosmos["ptrace"], EPERM, "cosmos must still refuse ptrace");
@@ -399,4 +400,89 @@ async fn container_create_keeps_the_cosmos_profile_and_passes_the_self_check() {
     println!("recorded security_opt keys: {}", requested_keys(&recorded));
 
     manager.remove(&info.id, true).await.expect("cleanup");
+}
+
+/// The half of the design that cannot be tested with `seccomp=` alone: AppArmor
+/// is what scopes the mount **target**, and a host that runs with the LSM off
+/// would let this profile mount anything.
+///
+/// Two assertions on the same container, with `seccomp=unconfined` so only the
+/// LSM can explain a refusal:
+///  - classic `mount(2)` of a `tmpfs` is **refused** (`EACCES`) — `tmpfs` is not
+///    in the shipped profile;
+///  - a real `fuse-overlayfs` rootfs **works** — `fstype=fuse.*` is.
+///
+/// Together they are the measurement the whole pairing rests on: seccomp grants
+/// the syscall, AppArmor decides the target.
+#[test]
+#[ignore = "requires docker, /dev/fuse, a host with celestia-cherino-fuse loaded, CHERINO_SECCOMP_TEST_FUSE_IMAGE"]
+fn named_apparmor_profile_scopes_the_mount_target() {
+    let Some(probe_image) = image() else {
+        panic!("set CHERINO_SECCOMP_TEST_IMAGE to an image with `gcc` and `sh`");
+    };
+    let Some(fuse_image) = std::env::var("CHERINO_SECCOMP_TEST_FUSE_IMAGE").ok() else {
+        panic!("set CHERINO_SECCOMP_TEST_FUSE_IMAGE to an image with `fuse-overlayfs`");
+    };
+    let profile = std::env::var("CHERINO_SECCOMP_TEST_APPARMOR_PROFILE")
+        .unwrap_or_else(|_| "celestia-cherino-fuse".to_string());
+
+    // 1. tmpfs is not in the profile: the classic mount syscall must be refused.
+    let probe = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--cap-add",
+            "SYS_ADMIN",
+            "--security-opt",
+        ])
+        .arg(format!("apparmor={profile}"))
+        .args(["--security-opt", "seccomp=unconfined", "-v"])
+        .arg(format!("{}:/fixture:ro", fixture_dir().display()))
+        .arg(&probe_image)
+        .args([
+            "sh",
+            "-c",
+            "gcc -O1 -o /tmp/probe /fixture/syscall_probe.c && /tmp/probe",
+        ])
+        .output()
+        .expect("docker run");
+    let parsed = parse_probe(&String::from_utf8_lossy(&probe.stdout));
+    assert_eq!(
+        parsed["mount"], 13,
+        "AppArmor must refuse a tmpfs mount (EACCES) so the seccomp grant is scoped: {parsed:?}"
+    );
+
+    // 2. The fstype the profile does list must work under the same confinement.
+    let fuse = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--cap-add",
+            "SYS_ADMIN",
+            "--device",
+            "/dev/fuse",
+            "--security-opt",
+        ])
+        .arg(format!("apparmor={profile}"))
+        .args(["--security-opt", "seccomp=unconfined"])
+        .arg(&fuse_image)
+        .args([
+            "sh",
+            "-c",
+            "mkdir -p /tmp/p/lower /tmp/p/upper /tmp/p/work /tmp/p/merged && echo ok > /tmp/p/lower/f && \
+             fuse-overlayfs -o lowerdir=/tmp/p/lower,upperdir=/tmp/p/upper,workdir=/tmp/p/work \
+             /tmp/p/merged && cat /tmp/p/merged/f && fusermount3 -u /tmp/p/merged",
+        ])
+        .output()
+        .expect("docker run");
+    let stdout = String::from_utf8_lossy(&fuse.stdout);
+    assert!(
+        fuse.status.success() && stdout.contains("ok"),
+        "fuse-overlayfs must be permitted under the named profile:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&fuse.stderr)
+    );
 }

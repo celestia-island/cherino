@@ -207,6 +207,18 @@ impl ContainerManager {
             ..Default::default()
         };
 
+        // Request-shape check before anything is created: a seccomp profile that
+        // admits `mount` without a named AppArmor profile would "apply cleanly"
+        // and leave mount(2) unscoped, so it must never be started at all (the
+        // post-start check compares the request with the daemon's echo and would
+        // happily confirm a boundary that does not exist).
+        security_profile::verify_mount_mediation(&security_opt).map_err(|reason| {
+            ContainerError::SecurityProfileDrift {
+                container_id: params.name.clone(),
+                drift: reason,
+            }
+        })?;
+
         let create_options = CreateContainerOptions {
             name: Some(params.name.clone()),
             ..Default::default()

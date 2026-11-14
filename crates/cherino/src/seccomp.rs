@@ -8,12 +8,14 @@
 //!
 //! # Profiles
 //!
-//! [`SeccompProfile::EntelecheiaDefault`] is the workload default: no mount, no
-//! namespace creation, no kernel surface. [`SeccompProfile::Cosmos`] is the
-//! same filter with the in-container FUSE/OCI family re-allowed — see
-//! [`SeccompProfileData::cosmos`] for why that family is needed and why
-//! releasing it does not release mount authority (AppArmor still decides which
-//! mounts are permitted).
+//! [`SeccompProfile::EntelecheiaDefault`] is the workload default: no `mount`,
+//! no kernel surface. [`SeccompProfile::Cosmos`] is the same filter with the two
+//! syscalls the in-container FUSE rootfs probe needs re-allowed — see
+//! [`SeccompProfileData::cosmos`]. Note what the default does **not** claim:
+//! `clone`/`clone3` are allow-listed without argument filtering, so namespace
+//! *creation* via clone flags is reachable (the boundary there is AppArmor and
+//! the absence of `mount`, not this list); only the standalone `unshare(2)` is
+//! denied by default.
 //!
 //! # Layering with AppArmor
 //!
@@ -401,12 +403,12 @@ impl SeccompProfileData {
                         "unlinkat".into(),
                         // `unshare` is intentionally NOT allow-listed here: it
                         // creates new namespaces and becomes an escape vector when
-                        // combined with SYS_ADMIN. This default is for a plain
-                        // workload. A cosmos container DOES run namespace-creating
-                        // code in-process (the Layer-5 OCI sandbox, youki), so the
-                        // cosmos preset re-allows the mount/namespace family
-                        // explicitly — see `SeccompProfileData::cosmos`. Nothing
-                        // else may widen it.
+                        // combined with SYS_ADMIN (which cosmos re-adds). Note the
+                        // limit of this statement: `clone`/`clone3` are allowed
+                        // above without argument filtering, so namespace creation
+                        // through clone flags stays reachable — this list is not
+                        // a namespace boundary, and the profiles do not claim to
+                        // be one.
                         "utime".into(),
                         "utimensat".into(),
                         "utimes".into(),
@@ -471,49 +473,50 @@ impl SeccompProfileData {
         profile
     }
 
-    /// The cosmos/scepter filter: [`Self::entelecheia_default`] plus the
-    /// in-container FUSE/OCI syscall family ([`COSMOS_FUSE_OCI_SYSCALLS`]).
+    /// The cosmos/scepter filter: [`Self::entelecheia_default`] plus the two
+    /// syscalls the in-container FUSE rootfs probe needs
+    /// ([`COSMOS_FUSE_PROBE_SYSCALLS`]).
     ///
-    /// Two callers run *inside* a cosmos container and need it:
+    /// **One caller justifies this list**: `cherino-runtime`'s
+    /// `detect_rootfs_capability` spawns `fuse-overlayfs -o
+    /// lowerdir=…,upperdir=…,workdir=… MERGED` (and `mount -t overlay overlay …`
+    /// as the kernel-overlay fallback). `fuse-overlayfs` runs as root in the
+    /// container, so libfuse issues classic `mount(2)` itself — the setuid
+    /// `fusermount3` path is inert under `no-new-privileges`.
     ///
-    /// 1. the rootfs capability probe (`cherino-runtime`'s
-    ///    `detect_rootfs_capability`) spawns `fuse-overlayfs -o
-    ///    lowerdir=…,upperdir=…,workdir=… MERGED` and `mount -t overlay
-    ///    overlay …`. `fuse-overlayfs` runs as root in the container, so libfuse
-    ///    issues `mount(2)` itself — the setuid `fusermount3` path is inert
-    ///    under `no-new-privileges`;
-    /// 2. the Layer-5 inner OCI sandbox: `plana_infra_services::
-    ///    cosmos_runtime_type()` picks `Youki` for a process that is inside a
-    ///    container with no Docker socket — which is exactly the cosmos
-    ///    container — and youki/libcontainer creates namespaces
-    ///    (`unshare`/`setns`/`clone`), mounts the rootfs (`mount`) and pivots
-    ///    into it (`pivot_root`).
+    /// **Not justified, and therefore not here: the inner OCI runtime.** The
+    /// Layer-5 sandbox (`libcontainer 0.7`, the crate `cherino-runtime` links)
+    /// mounts exclusively through the fd-based API — `open_tree`/`mount_setattr`/
+    /// `move_mount` for binds, `fsopen`/`fsconfig`/`fsmount`/… otherwise, with no
+    /// classic fallback (`libcontainer-0.7.0/src/rootfs/mount.rs`) — and AppArmor
+    /// does not mediate that API on kernel 6.1, so admitting it would reopen the
+    /// mount-authority bypass this profile exists to close. Consequence, stated
+    /// as a supported limit: **a cosmos container that hosts the inner OCI
+    /// runtime cannot run under this filter** — its first inner mount returns
+    /// EPERM (fail-closed, loudly). Reconciling the two needs either a substrate
+    /// whose LSM mediates the fd-based API or a runtime that uses classic
+    /// `mount(2)`; a `CosmosInnerOci`-style variant is a separate decision with
+    /// its own threat model, not a rider on this one.
     ///
-    /// What stays denied is the kernel-attack surface neither caller needs:
+    /// What stays denied is the kernel-attack surface no supported caller needs:
     /// `ptrace`, `bpf`, `kexec_load`/`kexec_file_load`, module load/unload, the
     /// keyring calls, `perf_event_open`, `userfaultfd`, `process_vm_readv`/
     /// `writev`, `reboot` and the swap calls. Mount *authority* is not granted:
     /// `mount(2)`'s `fstype` and target are pointers, so a syscall filter cannot
     /// scope them; the AppArmor profile `celestia-cherino-fuse` does
     /// (`mount fstype=fuse.*`, `overlay`, `proc`, `sysfs`, `cgroup`).
-    ///
-    /// The new mount API is **not** in the family, on purpose: AppArmor does not
-    /// mediate it on kernel 6.1 (measured — see
-    /// [`COSMOS_FUSE_OCI_SYSCALLS`]), so admitting `fsopen`/`move_mount`/
-    /// `open_tree` would be a mount-authority bypass of the very profile this
-    /// filter is paired with.
     pub fn cosmos() -> Self {
         let mut profile = Self::entelecheia_default();
         for rule in &mut profile.syscalls {
             match rule.action.as_str() {
                 "SCMP_ACT_ALLOW" => {
-                    for name in COSMOS_FUSE_OCI_SYSCALLS {
+                    for name in COSMOS_FUSE_PROBE_SYSCALLS {
                         insert_sorted(&mut rule.names, name);
                     }
                 }
                 "SCMP_ACT_ERRNO" => rule
                     .names
-                    .retain(|name| !COSMOS_FUSE_OCI_SYSCALLS.contains(&name.as_str())),
+                    .retain(|name| !COSMOS_FUSE_PROBE_SYSCALLS.contains(&name.as_str())),
                 _ => {}
             }
         }
@@ -525,34 +528,24 @@ impl SeccompProfileData {
     }
 }
 
-/// The syscalls the in-container FUSE rootfs probe and the in-container OCI
-/// runtime (Layer 5) need, and that a plain workload does not.
+/// The syscalls the in-container FUSE rootfs probe needs, and that a plain
+/// workload does not.
 ///
-/// Every name here is re-allowed for cosmos containers **only**, and every
-/// mount-capable one is mediated by AppArmor on the classic path (measured:
-/// `mount(2)` of `tmpfs` under `celestia-cherino-fuse` returns `EACCES`, while
-/// `fstype=fuse.*`/`overlay` succeed — see [`SeccompProfileData::cosmos`]).
+/// Re-allowed for cosmos containers **only**. Both are mediated by AppArmor on
+/// the classic path (measured: `mount(2)` of `tmpfs` under
+/// `celestia-cherino-fuse` returns `EACCES`, while `fstype=fuse.*`/`overlay`
+/// succeed — see [`SeccompProfileData::cosmos`]), so this grants the syscall,
+/// not the authority.
 ///
-/// **The new mount API is deliberately absent**: `fsopen`, `fsconfig`,
-/// `fsmount`, `move_mount`, `open_tree` and `mount_setattr` are not AppArmor-
+/// **The fd-based mount API is deliberately absent** — `fsopen`, `fsconfig`,
+/// `fsmount`, `move_mount`, `open_tree`, `mount_setattr` are not AppArmor-
 /// mediated on kernel 6.1 (measured 2026-11-15: classic `mount(2)` of tmpfs is
 /// refused with EACCES under the installed profile while
-/// `fsopen`→`fsconfig(CREATE)`→`fsmount`→`move_mount` of the same tmpfs
-/// succeeds and appears in `/proc/mounts`, and `open_tree(OPEN_TREE_CLONE)` of
-/// `/etc` succeeds). Admitting them would hand a workload exactly the mount
-/// capability the profile exists to deny, so they stay on the deny-by-default
-/// floor until the host LSM covers them. Neither caller needs them: the FUSE
-/// probe and libcontainer both use classic `mount(2)`.
-pub const COSMOS_FUSE_OCI_SYSCALLS: [&str; 8] = [
-    "chroot",
-    "close_range",
-    "mount",
-    "pivot_root",
-    "sethostname",
-    "setns",
-    "umount2",
-    "unshare",
-];
+/// `fsopen`→`fsconfig(CREATE)`→`fsmount`→`move_mount` of the same tmpfs succeeds
+/// and appears in `/proc/mounts`, and `open_tree(OPEN_TREE_CLONE)` of `/etc`
+/// succeeds). Their absence is also why the inner OCI runtime is unsupported
+/// here — `libcontainer 0.7` mounts only through that API.
+pub const COSMOS_FUSE_PROBE_SYSCALLS: &[&str] = &["mount", "umount2"];
 
 /// Inserts a name at its sorted position, keeping an allow-list readable and
 /// making a re-run idempotent.
@@ -738,11 +731,11 @@ mod tests {
     }
 
     #[test]
-    fn cosmos_profile_allows_the_fuse_and_oci_family() -> Result<()> {
+    fn cosmos_profile_allows_exactly_the_fuse_probe_syscalls() -> Result<()> {
         let profile = SeccompProfile::Cosmos.to_profile_data();
         let allow = rule(&profile, "SCMP_ACT_ALLOW")?;
         let deny = rule(&profile, "SCMP_ACT_ERRNO")?;
-        for name in COSMOS_FUSE_OCI_SYSCALLS {
+        for name in COSMOS_FUSE_PROBE_SYSCALLS.iter().copied() {
             ensure!(
                 allow.names.iter().any(|n| n == name),
                 "cosmos profile must allow {name}"
@@ -780,14 +773,22 @@ mod tests {
             "reboot",
             "swapon",
             "swapoff",
-            // The new mount API: not AppArmor-mediated on kernel 6.1, so it must
-            // stay on the deny-by-default floor even though it is a "mount".
+            // The fd-based mount API: not AppArmor-mediated on kernel 6.1, so it
+            // must stay on the deny-by-default floor even though it is a "mount".
+            // (It is also why the inner OCI runtime is unsupported here.)
             "fsopen",
             "fsconfig",
             "fsmount",
             "move_mount",
             "open_tree",
             "mount_setattr",
+            // The namespace family went away with the OCI half: nothing in the
+            // supported configuration creates namespaces in-container.
+            "unshare",
+            "setns",
+            "pivot_root",
+            "chroot",
+            "sethostname",
         ] {
             ensure!(
                 !allow.names.iter().any(|n| n == name),
@@ -809,24 +810,13 @@ mod tests {
                 "{name} must stay explicitly deny-listed"
             );
         }
-        // `pivot_root` is the one name that moves out of the deny rule: youki
-        // pivots into the container rootfs, and AppArmor already permits
-        // `pivot_root` for this profile.
-        ensure!(
-            allow.names.iter().any(|n| n == "pivot_root"),
-            "pivot_root must be allowed for the in-container OCI runtime"
-        );
-        ensure!(
-            !deny.names.iter().any(|n| n == "pivot_root"),
-            "pivot_root must not stay deny-listed"
-        );
         Ok(())
     }
 
     #[test]
     fn cosmos_profile_differs_from_default_only_in_the_declared_family() -> Result<()> {
         // Guards against silent drift: the cosmos preset is the default filter
-        // plus exactly COSMOS_FUSE_OCI_SYSCALLS, nothing else.
+        // plus exactly COSMOS_FUSE_PROBE_SYSCALLS, nothing else.
         let default = SeccompProfile::EntelecheiaDefault.to_profile_data();
         let cosmos = SeccompProfile::Cosmos.to_profile_data();
         let names_in = |profile: &SeccompProfileData, action: &str| -> Result<Vec<String>> {
@@ -837,7 +827,7 @@ mod tests {
         for action in ["SCMP_ACT_ALLOW", "SCMP_ACT_ERRNO"] {
             let mut expected = names_in(&default, action)?;
             let actual = names_in(&cosmos, action)?;
-            for name in COSMOS_FUSE_OCI_SYSCALLS {
+            for name in COSMOS_FUSE_PROBE_SYSCALLS.iter().copied() {
                 if action == "SCMP_ACT_ALLOW" {
                     if !expected.iter().any(|n| n == name) {
                         expected.push(name.to_string());
@@ -849,7 +839,7 @@ mod tests {
             expected.sort();
             ensure!(
                 expected == actual,
-                "{action} rule drift: cosmos differs from default outside COSMOS_FUSE_OCI_SYSCALLS \
+                "{action} rule drift: cosmos differs from default outside COSMOS_FUSE_PROBE_SYSCALLS \
                  (expected {expected:?}, got {actual:?})"
             );
         }

@@ -29,11 +29,19 @@ the container config. Seccomp filtering is the first line of defence: it
 constrains which syscalls a sandboxed workload may make at all.
 
 Three profiles cover the preset families: `EntelecheiaDefault` (a plain
-workload: no mount, no namespace creation), `Compile` (the default minus
-`userfaultfd`) and `Cosmos` (the default **plus** the mount/namespace family the
-cosmos container needs in-process — the `fuse-overlayfs` rootfs probe and the
-inner OCI runtime — while `ptrace`, `bpf`, `kexec_load`, module loading and the
-keyring calls stay denied).
+workload: no `mount`), `Compile` (the default minus `userfaultfd`) and `Cosmos`
+(the default **plus** `mount` and `umount2`, which the in-container
+`fuse-overlayfs` rootfs probe needs; `ptrace`, `bpf`, `kexec_load`, module
+loading and the keyring calls stay denied).
+
+`Cosmos` deliberately does **not** admit the fd-based mount API
+(`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/`mount_setattr`): AppArmor
+does not mediate that API on kernel 6.1, so admitting it would hand a workload
+the mount authority the AppArmor profile denies on the classic path. One
+consequence is documented as a supported limit rather than a bug: a cosmos
+container that hosts the inner OCI runtime (`libcontainer 0.7`, which mounts only
+through that fd-based API) cannot run under this filter — its first inner mount
+fails closed with `EPERM`.
 
 seccomp cannot express "only FUSE mounts": a filter compares scalar arguments
 and `mount(2)`'s `fstype`/target are pointers. That half of the boundary is

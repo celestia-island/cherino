@@ -95,13 +95,15 @@ pub fn scepter_readonly() -> ContainerSecurity {
 /// the cosmos seccomp filter.
 ///
 /// Both are load-bearing and neither is optional. seccomp decides which
-/// syscalls exist (deny-by-default, with the in-container FUSE/OCI family
-/// re-allowed — see [`seccomp::SeccompProfileData::cosmos`]); AppArmor decides
-/// which mounts are permitted (`fstype=fuse.*`, `overlay`, …). seccomp cannot
+/// syscalls exist (deny-by-default, with the two classic-mount syscalls the
+/// in-container FUSE rootfs probe needs re-allowed — see
+/// [`seccomp::SeccompProfileData::cosmos`]); AppArmor decides which mounts are
+/// permitted (`fstype=fuse.*`, `overlay`, …). seccomp cannot
 /// scope `mount(2)` because its `fstype`/target arguments are pointers, so
 /// shipping seccomp without the AppArmor profile would be unconfined mounting,
 /// and shipping AppArmor without seccomp (the state before this change) left
-/// `ptrace`/`bpf`/`kexec_load` reachable.
+/// `ptrace`/`bpf`/`kexec_load` reachable. [`verify_mount_mediation`] enforces
+/// the pairing on any caller-supplied list.
 ///
 /// The pair is asserted at container-creation time by
 /// [`verify_effective_security_opts`].
@@ -134,11 +136,16 @@ pub fn security_opt_key(opt: &str) -> &str {
     opt.split(['=', ':']).next().unwrap_or(opt).trim()
 }
 
-/// The value of one `security_opt` entry, or the whole entry when it carries no
-/// separator.
+/// The value of one `security_opt` entry: everything after the first `=` or `:`,
+/// trimmed, or `""` when the entry carries no separator.
+///
+/// Separator-based on purpose: slicing by the key's length would be wrong for an
+/// entry with leading whitespace and panic on a non-ASCII key.
 fn security_opt_value(opt: &str) -> &str {
-    let key = security_opt_key(opt);
-    opt[key.len()..].trim_start_matches(['=', ':']).trim()
+    match opt.find(['=', ':']) {
+        Some(at) => opt[at + 1..].trim(),
+        None => "",
+    }
 }
 
 /// One requested `security_opt` entry the live container does not carry as
@@ -149,11 +156,14 @@ pub struct SecurityOptDrift {
     pub missing: Vec<String>,
     /// Keys present with a different value.
     pub mismatched: Vec<String>,
+    /// Keys that appear more than once on either side: which one the runtime
+    /// applies is not defined, so the boundary is not what the list says.
+    pub duplicated: Vec<String>,
 }
 
 impl SecurityOptDrift {
     pub fn is_empty(&self) -> bool {
-        self.missing.is_empty() && self.mismatched.is_empty()
+        self.missing.is_empty() && self.mismatched.is_empty() && self.duplicated.is_empty()
     }
 
     /// A one-line description that names keys only — the seccomp entry is a
@@ -166,8 +176,62 @@ impl SecurityOptDrift {
         if !self.mismatched.is_empty() {
             parts.push(format!("mismatched {}", self.mismatched.join(", ")));
         }
+        if !self.duplicated.is_empty() {
+            parts.push(format!("duplicated {}", self.duplicated.join(", ")));
+        }
         parts.join("; ")
     }
+}
+
+/// The cosmos filter admits `mount`, and seccomp cannot scope `mount(2)`'s
+/// target — so that half is only safe together with a named AppArmor profile.
+///
+/// Returns `Err(reason)` when a `security_opt` list pairs a seccomp profile that
+/// admits `mount` with no `apparmor=` entry, or with `apparmor=unconfined`.
+/// That combination is one call away (`build_security_opts(Some(Cosmos))` is
+/// exactly how `compile()` builds its list) and it is the difference between a
+/// scoped boundary and unconfined mounting, so it is checked rather than
+/// assumed. Lists whose seccomp profile denies `mount` (the default and
+/// `compile` presets) are fine on their own.
+pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
+    // A named AppArmor profile is the thing that scopes `mount(2)`'s target, so
+    // its presence is sufficient and its absence is what must be disproved.
+    let named_apparmor = requested
+        .iter()
+        .find(|opt| security_opt_key(opt) == "apparmor")
+        .map(|opt| security_opt_value(opt))
+        .is_some_and(|name| !name.is_empty() && name != "unconfined");
+    if named_apparmor {
+        return Ok(());
+    }
+    // Fail closed: without AppArmor, the only acceptable list is one whose
+    // seccomp profile **provably denies** `mount`. Anything we cannot parse —
+    // `seccomp=unconfined`, a profile path, no seccomp entry at all — is
+    // unproven, and unproven means refused.
+    let denies_mount = requested
+        .iter()
+        .find(|opt| security_opt_key(opt) == "seccomp")
+        .and_then(|opt| serde_json::from_str::<serde_json::Value>(security_opt_value(opt)).ok())
+        .is_some_and(|profile| {
+            let allows_mount = profile["syscalls"].as_array().is_some_and(|rules| {
+                rules.iter().any(|rule| {
+                    rule["action"] == "SCMP_ACT_ALLOW"
+                        && rule["names"]
+                            .as_array()
+                            .is_some_and(|names| names.iter().any(|name| name == "mount"))
+                })
+            });
+            !allows_mount
+        });
+    if denies_mount {
+        return Ok(());
+    }
+    Err(
+        "mount is not scoped: no named AppArmor profile is present and the seccomp entry \
+         does not provably deny `mount` (unconfined, a profile path, a filter that admits \
+         mount, or no filter at all)"
+            .to_string(),
+    )
 }
 
 /// Checks that every requested `security_opt` entry is actually in effect on the
@@ -184,6 +248,17 @@ pub fn verify_effective_security_opts(
     actual: &[String],
 ) -> Result<(), SecurityOptDrift> {
     let mut drift = SecurityOptDrift::default();
+    for side in [requested, actual] {
+        for key in side.iter().map(|opt| security_opt_key(opt)) {
+            let seen = side
+                .iter()
+                .filter(|opt| security_opt_key(opt) == key)
+                .count();
+            if seen > 1 && !drift.duplicated.iter().any(|k| k == key) {
+                drift.duplicated.push(key.to_string());
+            }
+        }
+    }
     for want in requested {
         let key = security_opt_key(want);
         match actual.iter().find(|have| security_opt_key(have) == key) {
@@ -667,8 +742,8 @@ mod tests {
             "cosmos seccomp must allow mount"
         );
         ensure!(
-            allowed.contains(&"unshare"),
-            "cosmos seccomp must allow unshare for the in-container OCI runtime"
+            !allowed.contains(&"unshare"),
+            "the namespace family left with the OCI half: unshare must not be allowed"
         );
         let denied: Vec<&str> = parsed["syscalls"]
             .as_array()
@@ -708,6 +783,113 @@ mod tests {
             "no-new-privileges must not be duplicated: {merged:?}"
         );
         ensure!(merged.len() == 3, "exactly three distinct keys: {merged:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn cosmos_security_opts_pass_the_mount_mediation_guard() -> Result<()> {
+        ensure!(
+            verify_mount_mediation(&cosmos_security_opts()).is_ok(),
+            "the cosmos pair must satisfy its own guard"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_mount_capable_filter_without_apparmor_is_refused() -> Result<()> {
+        // Exactly how `compile()` assembles its list: the seccomp entry alone.
+        let lone = seccomp::build_security_opts(Some(seccomp::SeccompProfile::Cosmos));
+        let reason = verify_mount_mediation(&lone)
+            .expect_err("seccomp-with-mount and no AppArmor must be refused");
+        ensure!(
+            reason.contains("AppArmor"),
+            "the reason must name what is missing: {reason}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apparmor_unconfined_does_not_mediate_mounts() -> Result<()> {
+        let mut opts = seccomp::build_security_opts(Some(seccomp::SeccompProfile::Cosmos));
+        opts.push("apparmor=unconfined".to_string());
+        ensure!(
+            verify_mount_mediation(&opts).is_err(),
+            "unconfined AppArmor leaves mount(2) unscoped and must be refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_filter_that_denies_mount_needs_no_apparmor() -> Result<()> {
+        for profile in [
+            seccomp::SeccompProfile::EntelecheiaDefault,
+            seccomp::SeccompProfile::Compile,
+        ] {
+            ensure!(
+                verify_mount_mediation(&seccomp::build_security_opts(Some(profile))).is_ok(),
+                "{profile:?} denies mount and must pass on its own"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unproven_seccomp_without_apparmor_is_refused() -> Result<()> {
+        // Fail closed: `unconfined`, a profile path, and "no filter at all" all
+        // leave mount(2) unscoped and none of them may pass.
+        for opts in [
+            vec!["seccomp=unconfined".to_string()],
+            vec![
+                "seccomp=unconfined".to_string(),
+                "apparmor=unconfined".to_string(),
+            ],
+            vec!["seccomp=/etc/docker/cosmos.json".to_string()],
+            vec!["no-new-privileges:true".to_string()],
+            vec![],
+        ] {
+            ensure!(
+                verify_mount_mediation(&opts).is_err(),
+                "unproven mount mediation must be refused: {opts:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_named_apparmor_scopes_mount_even_with_an_unconfined_seccomp() -> Result<()> {
+        let opts = vec![
+            "seccomp=unconfined".to_string(),
+            "apparmor=celestia-cherino-fuse".to_string(),
+        ];
+        ensure!(
+            verify_mount_mediation(&opts).is_ok(),
+            "a named AppArmor profile is what scopes mount(2)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_keys_are_drift() -> Result<()> {
+        let requested = cosmos_security_opts();
+        let mut actual = requested.clone();
+        actual.push("seccomp=unconfined".to_string());
+        let drift = verify_effective_security_opts(&requested, &actual)
+            .expect_err("two seccomp entries mean the applied one is undefined");
+        ensure!(
+            drift.duplicated == vec!["seccomp".to_string()],
+            "the drift must name the duplicated key: {drift:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn security_opt_value_handles_whitespace_and_non_ascii_keys() -> Result<()> {
+        // Regression: slicing by the key's byte length panicked on a non-ASCII
+        // key with leading whitespace and returned a wrong value otherwise.
+        ensure!(security_opt_value("  seccomp={\"a\":1}") == "{\"a\":1}");
+        ensure!(security_opt_value("apparmor=celestia-cherino-fuse") == "celestia-cherino-fuse");
+        ensure!(security_opt_value("no-new-privileges:true") == "true");
+        ensure!(security_opt_value("privéleged") == "");
         Ok(())
     }
 

@@ -12,10 +12,12 @@
 //! | `entelecheia_default` | the workload default | all refused ⇒ the reason the gap existed |
 //! | `cosmos` | the new preset | mount/umount2/unshare allowed; ptrace/bpf/process_vm_readv still refused |
 //!
-//! `apparmor=unconfined` is passed on every run so that the observed EPERMs can
-//! only come from seccomp; the AppArmor mount mediation is a separate layer
-//! (see `crates/cherino/src/apparmor/celestia-cherino-fuse`) and is asserted
-//! structurally by the unit tests in `security_profile`.
+//! The matrix runs with `apparmor=unconfined` so that every observed EPERM can
+//! only come from seccomp: the AppArmor half is a different layer and would
+//! otherwise mask the result (it permits `fstype=fuse.*`/`overlay`, not the
+//! `tmpfs` the probe mounts). The FUSE test is the other half — set
+//! `CHERINO_SECCOMP_TEST_APPARMOR=celestia-cherino-fuse` on a host that has the
+//! named profile loaded and it runs the production pairing end to end.
 //!
 //! Run with:
 //!
@@ -132,6 +134,15 @@ fn run_probe(filter: Filter, image: &str) -> BTreeMap<String, i32> {
     parse_probe(&stdout)
 }
 
+/// The `security_opt` keys only: the seccomp body is a multi-kilobyte JSON
+/// document and must not be dumped into test output.
+fn requested_keys(opts: &[String]) -> String {
+    opts.iter()
+        .map(|o| o.split(['=', ':']).next().unwrap_or(o).to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn parse_probe(stdout: &str) -> BTreeMap<String, i32> {
     let mut seen = BTreeMap::new();
     for line in stdout.lines() {
@@ -227,6 +238,10 @@ fn cosmos_seccomp_boundary_matrix() {
 
 /// The real probe binary, in the real image that runs it: `fuse-overlayfs`
 /// mounting a merged rootfs under the cosmos filter and the FUSE device.
+///
+/// `CHERINO_SECCOMP_TEST_APPARMOR` selects the LSM half: `unconfined` (default,
+/// works anywhere) or `celestia-cherino-fuse` (the production profile — the
+/// complete pairing, needs the profile loaded on the host).
 #[test]
 #[ignore = "requires docker, /dev/fuse, CHERINO_SECCOMP_TEST_FUSE_IMAGE (an image with fuse-overlayfs)"]
 fn cosmos_seccomp_allows_the_fuse_rootfs_probe() {
@@ -265,9 +280,13 @@ echo PROBE_OK
             "--device",
             "/dev/fuse",
             "--security-opt",
-            "apparmor=unconfined",
-            "--security-opt",
         ])
+        .arg(format!(
+            "apparmor={}",
+            std::env::var("CHERINO_SECCOMP_TEST_APPARMOR")
+                .unwrap_or_else(|_| "unconfined".to_string())
+        ))
+        .arg("--security-opt")
         .arg(format!(
             "seccomp={}",
             profile_dir.path().join("seccomp.json").display()
@@ -287,4 +306,76 @@ echo PROBE_OK
         "the merged rootfs must serve its lower layer:\nstdout:\n{stdout}"
     );
     println!("{stdout}");
+}
+
+/// The wiring, not just the comparison: a container created through the real
+/// `ContainerManager` with the real `cosmos()` preset must pass the startup
+/// self-check and come back carrying both halves of the boundary.
+///
+/// This is the only test that exercises the post-start inspect path end to end;
+/// the unit tests cover the comparison itself, and drift cannot be induced on a
+/// live daemon (which is why the failure branch is exercised by those units).
+#[tokio::test]
+#[ignore = "requires docker + CHERINO_SECCOMP_TEST_IMAGE"]
+async fn container_create_keeps_the_cosmos_profile_and_passes_the_self_check() {
+    use cherino::security_profile;
+
+    let Some(image) = image() else {
+        panic!("set CHERINO_SECCOMP_TEST_IMAGE to an image that has `sh`");
+    };
+    let manager = cherino::ContainerManager::new().expect("docker connection");
+
+    let preset = security_profile::cosmos();
+    let mut params = cherino::types::ContainerCreateParams::simple(
+        format!("cherino-r2-seccomp-{}", std::process::id()),
+        image,
+    );
+    params.network = Some("bridge".to_string());
+    params.cap_drop = preset.cap_drop.clone();
+    params.cap_add = preset.cap_add.clone();
+    params.security_opt = preset.security_opt.clone();
+    params.read_only_rootfs = Some(false);
+    params.egress_policy = None;
+
+    // `create` runs the self-check: a profile the runtime did not apply would
+    // come back as `SecurityProfileDrift` here, not as a healthy container.
+    let info = manager
+        .create(&params)
+        .await
+        .expect("create must pass the startup security self-check");
+
+    // `create` succeeding is the wiring proof: it runs the same comparison on
+    // the recorded options and fails the create on drift. Read them back anyway
+    // so the evidence is in the test output, not only in the code path.
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{json .HostConfig.SecurityOpt}}",
+            &info.id,
+        ])
+        .output()
+        .expect("docker inspect");
+    assert!(
+        output.status.success(),
+        "docker inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recorded: Vec<String> = serde_json::from_slice(&output.stdout).expect("security_opt json");
+    let requested = params.security_opt.clone().unwrap_or_default();
+    security_profile::verify_effective_security_opts(&requested, &recorded)
+        .expect("the recorded security_opt must match the requested one");
+    assert!(
+        recorded.iter().any(|o| o.starts_with("seccomp=")),
+        "seccomp must be recorded on the container: {recorded:?}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .any(|o| o.starts_with("apparmor=") && o != "apparmor=unconfined"),
+        "the named AppArmor profile must be recorded: {recorded:?}"
+    );
+    println!("recorded security_opt keys: {}", requested_keys(&recorded));
+
+    manager.remove(&info.id, true).await.expect("cleanup");
 }

@@ -187,6 +187,46 @@ mod tests {
         );
     }
 
+    /// The environment read itself, and the `None` arm behind it.
+    ///
+    /// One combined test on purpose: both halves mutate `DOCKER_HOST`, so splitting
+    /// them would let two test threads race on the same variable. Mirrors the
+    /// precedent in `lifecycle.rs` (`network_default_tests`): save, mutate under a
+    /// SAFETY comment, assert, restore.
+    #[test]
+    fn connect_local_reads_the_environment() {
+        let ambient = std::env::var("DOCKER_HOST").ok();
+        // SAFETY: test-only env mutation. The crate's only other env-mutating test
+        // is in `lifecycle` and touches a different variable; cargo may still run
+        // tests in parallel, so this test owns DOCKER_HOST for its duration.
+        unsafe {
+            // An unsupported value must surface as an error, which also proves the
+            // environment was read at all: a `dispatch_docker_host(None)` mutation
+            // (or a typo'd variable name) would reach the local-defaults path and
+            // return Ok on a host that has a socket.
+            std::env::set_var("DOCKER_HOST", "fd://");
+            let err = connect_local().expect_err("DOCKER_HOST=fd:// must be rejected");
+            assert!(
+                format!("{err}").contains("fd://"),
+                "the error must quote the rejected value: {err}"
+            );
+
+            // The `None` arm must reach bollard's local defaults, which themselves
+            // honour a unix:// DOCKER_HOST and eagerly check the path — so a
+            // `None => connect_http(..)` mutation (lazy, always Ok) is observable
+            // here as the absence of an error.
+            std::env::set_var("DOCKER_HOST", "unix:///nonexistent-cherino-local.sock");
+            assert!(
+                dispatch_docker_host(None).is_err(),
+                "None must reach connect_with_local_defaults, which honours unix:// and checks the path"
+            );
+        }
+        match ambient {
+            Some(value) => unsafe { std::env::set_var("DOCKER_HOST", value) },
+            None => unsafe { std::env::remove_var("DOCKER_HOST") },
+        }
+    }
+
     #[test]
     fn whitespace_and_mixed_case_hosts_are_normalised() {
         match classify("  tcp://ProXy:2375  ") {

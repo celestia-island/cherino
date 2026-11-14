@@ -486,11 +486,14 @@ impl SeccompProfileData {
     ///
     /// **Not justified, and therefore not here: the inner OCI runtime.** The
     /// Layer-5 sandbox (`libcontainer 0.7`, the crate `cherino-runtime` links)
-    /// mounts exclusively through the fd-based API — `open_tree`/`mount_setattr`/
-    /// `move_mount` for binds, `fsopen`/`fsconfig`/`fsmount`/… otherwise, with no
-    /// classic fallback (`libcontainer-0.7.0/src/rootfs/mount.rs`) — and AppArmor
-    /// does not mediate that API on kernel 6.1, so admitting it would reopen the
-    /// mount-authority bypass this profile exists to close. Consequence, stated
+    /// mounts every filesystem through the fd-based API —
+    /// `open_tree`/`mount_setattr`/`move_mount` for binds,
+    /// `fsopen`/`fsconfig`/`fsmount`/… otherwise, with no classic fallback
+    /// (`libcontainer-0.7.0/src/rootfs/mount.rs`) — and AppArmor does not
+    /// mediate that API on kernel 6.1, so admitting it would reopen the
+    /// mount-authority bypass this profile exists to close. (Its one classic
+    /// `mount(2)` call is the `MS_PRIVATE` propagation remount, which does
+    /// succeed here — that does not rescue the runtime, it fails earlier.) Consequence, stated
     /// as a supported limit: **a cosmos container that hosts the inner OCI
     /// runtime cannot run under this filter** — its first inner mount returns
     /// EPERM (fail-closed, loudly). Reconciling the two needs either a substrate

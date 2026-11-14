@@ -28,6 +28,20 @@ and `build_security_opts` renders a profile into `security_opt` entries for
 the container config. Seccomp filtering is the first line of defence: it
 constrains which syscalls a sandboxed workload may make at all.
 
+Three profiles cover the preset families: `EntelecheiaDefault` (a plain
+workload: no mount, no namespace creation), `Compile` (the default minus
+`userfaultfd`) and `Cosmos` (the default **plus** the mount/namespace family the
+cosmos container needs in-process — the `fuse-overlayfs` rootfs probe and the
+inner OCI runtime — while `ptrace`, `bpf`, `kexec_load`, module loading and the
+keyring calls stay denied).
+
+seccomp cannot express "only FUSE mounts": a filter compares scalar arguments
+and `mount(2)`'s `fstype`/target are pointers. That half of the boundary is
+AppArmor's (below), so a profile that admits `mount` is only safe together with
+the named profile — `security_profile::cosmos_security_opts` emits both, and
+`ContainerManager::create` asserts at startup that the container really carries
+both (`verify_effective_security_opts`).
+
 ## AppArmor
 
 Nested containers need to mount FUSE filesystems, which the default AppArmor

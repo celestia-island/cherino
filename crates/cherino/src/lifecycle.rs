@@ -40,6 +40,48 @@ fn default_network() -> String {
 }
 
 impl ContainerManager {
+    /// Asserts that the live container carries every security option the
+    /// profile requested (see `security_profile::verify_effective_security_opts`
+    /// for the comparison: by key, JSON-wise for `seccomp`, supersets allowed).
+    ///
+    /// This is a startup self-check, not a policy: it never adds options and
+    /// never loosens anything. It exists because a silently dropped
+    /// `seccomp=`/`apparmor=` entry is indistinguishable from a healthy
+    /// container once the workload is running.
+    async fn verify_security_profile(
+        &self,
+        container_id: &str,
+        requested: &[String],
+    ) -> ContainerResult<()> {
+        let inspected = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }
+                ) {
+                    ContainerError::NotFound(container_id.to_string())
+                } else {
+                    ContainerError::from(e)
+                }
+            })?;
+        let actual = inspected
+            .host_config
+            .and_then(|host| host.security_opt)
+            .unwrap_or_default();
+        security_profile::verify_effective_security_opts(requested, &actual).map_err(|drift| {
+            ContainerError::SecurityProfileDrift {
+                container_id: container_id.to_string(),
+                drift: drift.summary(),
+            }
+        })
+    }
+
     pub async fn create(&self, params: &ContainerCreateParams) -> ContainerResult<ContainerInfo> {
         // The default bridge network is deployment-specific; the generic
         // CONTAINER_NETWORK env override wins, the legacy entelecheia-network
@@ -86,7 +128,9 @@ impl ContainerManager {
             pids_limit: params.pids_limit,
             cap_drop: Some(cap_drop),
             cap_add: params.cap_add.clone(),
-            security_opt: Some(security_opt),
+            // Kept alive past the HostConfig move: the post-start self-check
+            // compares against exactly what was requested here.
+            security_opt: Some(security_opt.clone()),
             readonly_rootfs: params.read_only_rootfs,
             group_add: params.group_add.clone(),
             devices: if params.devices.is_empty() {
@@ -206,6 +250,36 @@ impl ContainerManager {
                 )
                 .await;
             return Err(e.into());
+        }
+
+        // Startup self-check: a runtime that drops or rewrites a security option
+        // downgrades the sandbox without failing, and the downgrade is invisible
+        // from inside the running container (the live sandbox that prompted R2
+        // carried AppArmor but no seccomp while its profile claimed otherwise).
+        // Compare what the runtime actually recorded against what the profile
+        // requested, and tear the container down on any drift: a caller must
+        // never receive a sandbox whose profile is weaker than declared.
+        if let Err(drift) = self
+            .verify_security_profile(&response.id, &security_opt)
+            .await
+        {
+            warn!(
+                container = %params.name,
+                container_id = %response.id,
+                error = %drift,
+                "security profile drift — removing the container instead of returning it"
+            );
+            let _ = self
+                .docker
+                .remove_container(
+                    &response.id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(drift);
         }
 
         if !network.is_empty() {

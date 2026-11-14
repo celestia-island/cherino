@@ -59,6 +59,19 @@ pub fn scepter() -> ContainerSecurity {
         // inside the container, which cosmos sub-container rootfs isolation
         // needs. Use the named FUSE-capable profile (not apparmor=unconfined),
         // with a DEV-ONLY unconfined fallback via CHERINO_APPARMOR_UNCONFINED.
+        //
+        // NO seccomp filter here, deliberately: this container is the
+        // orchestrator. It talks to the Docker socket and, in local (L1) mode,
+        // is the process that creates the inner OCI sandbox — so it needs the
+        // whole mount/namespace family *plus* whatever youki/libcontainer does
+        // next (setns into the new namespaces, pivot_root, cgroup mounts). A
+        // deny-by-default filter that admits all of that is close to no filter,
+        // while adding a new way for the platform's control plane to fail; the
+        // agent workload was the actual exposure and it is now filtered in
+        // [`cosmos`]. This exception is stated in the boundary table of
+        // entelecheia/docs/{en,zh-Hans}/designs/security.md and tracked as a
+        // follow-up (a scepter-specific profile needs a privileged test lane,
+        // not a blind allowlist).
         security_opt: Some(apparmor::fuse_security_opts()),
         // The scepter orchestrator is long-lived infrastructure: its image and
         // runtime helpers may write into system paths, so keep the rootfs
@@ -78,6 +91,134 @@ pub fn scepter_readonly() -> ContainerSecurity {
     }
 }
 
+/// `security_opt` for the cosmos preset: the named FUSE AppArmor profile **and**
+/// the cosmos seccomp filter.
+///
+/// Both are load-bearing and neither is optional. seccomp decides which
+/// syscalls exist (deny-by-default, with the in-container FUSE/OCI family
+/// re-allowed — see [`seccomp::SeccompProfileData::cosmos`]); AppArmor decides
+/// which mounts are permitted (`fstype=fuse.*`, `overlay`, …). seccomp cannot
+/// scope `mount(2)` because its `fstype`/target arguments are pointers, so
+/// shipping seccomp without the AppArmor profile would be unconfined mounting,
+/// and shipping AppArmor without seccomp (the state before this change) left
+/// `ptrace`/`bpf`/`kexec_load` reachable.
+///
+/// The pair is asserted at container-creation time by
+/// [`verify_effective_security_opts`].
+pub fn cosmos_security_opts() -> Vec<String> {
+    merge_security_opts(
+        apparmor::fuse_security_opts(),
+        seccomp::build_security_opts(Some(seccomp::SeccompProfile::Cosmos)),
+    )
+}
+
+/// Concatenates two `security_opt` lists, keeping the first entry per key
+/// (`no-new-privileges` is emitted by both helpers).
+fn merge_security_opts(primary: Vec<String>, secondary: Vec<String>) -> Vec<String> {
+    let mut merged = primary;
+    for opt in secondary {
+        let key = security_opt_key(&opt);
+        if !merged
+            .iter()
+            .any(|existing| security_opt_key(existing) == key)
+        {
+            merged.push(opt);
+        }
+    }
+    merged
+}
+
+/// The key of one Docker `security_opt` entry: the text before the first `=` or
+/// `:` (`seccomp={...}`, `apparmor=…`, `no-new-privileges:true`).
+pub fn security_opt_key(opt: &str) -> &str {
+    opt.split(['=', ':']).next().unwrap_or(opt).trim()
+}
+
+/// The value of one `security_opt` entry, or the whole entry when it carries no
+/// separator.
+fn security_opt_value(opt: &str) -> &str {
+    let key = security_opt_key(opt);
+    opt[key.len()..].trim_start_matches(['=', ':']).trim()
+}
+
+/// One requested `security_opt` entry the live container does not carry as
+/// requested.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SecurityOptDrift {
+    /// Keys absent from the container entirely.
+    pub missing: Vec<String>,
+    /// Keys present with a different value.
+    pub mismatched: Vec<String>,
+}
+
+impl SecurityOptDrift {
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.mismatched.is_empty()
+    }
+
+    /// A one-line description that names keys only — the seccomp entry is a
+    /// multi-kilobyte JSON document and must never be echoed whole.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.missing.is_empty() {
+            parts.push(format!("missing {}", self.missing.join(", ")));
+        }
+        if !self.mismatched.is_empty() {
+            parts.push(format!("mismatched {}", self.mismatched.join(", ")));
+        }
+        parts.join("; ")
+    }
+}
+
+/// Checks that every requested `security_opt` entry is actually in effect on the
+/// container the runtime created.
+///
+/// This is the startup self-check: a runtime that silently drops, rewrites or
+/// ignores a security option downgrades the sandbox without failing, and the
+/// difference is invisible from inside the container once it is running. The
+/// comparison is by key, and values are compared JSON-wise for `seccomp` so that
+/// a re-serialized profile still matches; extra entries on the container are
+/// allowed (supersets are not downgrades).
+pub fn verify_effective_security_opts(
+    requested: &[String],
+    actual: &[String],
+) -> Result<(), SecurityOptDrift> {
+    let mut drift = SecurityOptDrift::default();
+    for want in requested {
+        let key = security_opt_key(want);
+        match actual.iter().find(|have| security_opt_key(have) == key) {
+            None => drift.missing.push(key.to_string()),
+            Some(have) if !opt_values_match(key, want, have) => {
+                drift.mismatched.push(key.to_string())
+            }
+            Some(_) => {}
+        }
+    }
+    if drift.is_empty() { Ok(()) } else { Err(drift) }
+}
+
+fn opt_values_match(key: &str, requested: &str, actual: &str) -> bool {
+    let want = security_opt_value(requested);
+    let have = security_opt_value(actual);
+    if want == have {
+        return true;
+    }
+    if key != "seccomp" {
+        return false;
+    }
+    // Docker resolves `seccomp=/path/to/profile.json` (or a named profile) into
+    // the profile itself, so only an inline JSON request can be compared field
+    // by field; anything else is presence-checked.
+    match (
+        serde_json::from_str::<serde_json::Value>(want),
+        serde_json::from_str::<serde_json::Value>(have),
+    ) {
+        (Ok(want), Ok(have)) => want == have,
+        (Err(_), _) => true,
+        (Ok(_), Err(_)) => false,
+    }
+}
+
 pub fn cosmos() -> ContainerSecurity {
     ContainerSecurity {
         // Drop ALL then add back the minimal set cosmos sub-containers need:
@@ -94,10 +235,11 @@ pub fn cosmos() -> ContainerSecurity {
             "SETUID".to_string(),
             "DAC_OVERRIDE".to_string(),
         ]),
-        // Relax seccomp — the EntelecheiaDefault whitelist blocks `mount` which
-        // scepter may probe during startup. Use the same named FUSE-capable
-        // AppArmor profile as the scepter orchestrator (not unconfined).
-        security_opt: Some(apparmor::fuse_security_opts()),
+        // The cosmos filter: deny-by-default with the in-container FUSE/OCI
+        // syscall family re-allowed, paired with the named FUSE-capable AppArmor
+        // profile that decides *which* mounts are permitted. Never one without
+        // the other — see [`cosmos_security_opts`].
+        security_opt: Some(cosmos_security_opts()),
         // Ephemeral agent sandbox: hardened by default. The rootfs is an
         // immutable snapshot (fork = copy-on-write snapshot of the rootfs);
         // all legitimate writes go to workspace volumes or the tmpfs scratch
@@ -337,6 +479,10 @@ mod tests {
                 .any(|o| o == &format!("apparmor={}", apparmor::installed_profile_name())),
             "cosmos uses the named FUSE AppArmor profile"
         );
+        assert!(
+            sec_opt.iter().any(|o| o.starts_with("seccomp=")),
+            "cosmos carries the cosmos seccomp filter (closed 2026-11-15)"
+        );
         assert!(hc.dns.is_some());
         Ok(())
     }
@@ -474,6 +620,192 @@ mod tests {
                 name
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cosmos_security_opts_carry_apparmor_and_seccomp() -> Result<()> {
+        let opts = cosmos_security_opts();
+        ensure!(
+            opts.iter()
+                .any(|o| o == &format!("apparmor={}", apparmor::installed_profile_name())),
+            "the named FUSE AppArmor profile must be present: {:?}",
+            opts.iter().map(|o| security_opt_key(o)).collect::<Vec<_>>()
+        );
+        ensure!(
+            opts.iter().any(|o| o.starts_with("seccomp=")),
+            "the cosmos seccomp filter must be present: {:?}",
+            opts.iter().map(|o| security_opt_key(o)).collect::<Vec<_>>()
+        );
+        ensure!(
+            opts.iter()
+                .any(|o| security_opt_key(o) == "no-new-privileges"),
+            "no-new-privileges must survive the merge"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cosmos_seccomp_entry_is_the_cosmos_profile_json() -> Result<()> {
+        let opts = cosmos_security_opts();
+        let seccomp = opts
+            .iter()
+            .find(|o| o.starts_with("seccomp="))
+            .context("seccomp entry expected")?;
+        let value = security_opt_value(seccomp);
+        let parsed: serde_json::Value = serde_json::from_str(value)?;
+        let allowed: Vec<&str> = parsed["syscalls"]
+            .as_array()
+            .context("syscalls")?
+            .iter()
+            .filter(|rule| rule["action"] == "SCMP_ACT_ALLOW")
+            .flat_map(|rule| rule["names"].as_array().into_iter().flatten())
+            .filter_map(|n| n.as_str())
+            .collect();
+        ensure!(
+            allowed.contains(&"mount"),
+            "cosmos seccomp must allow mount"
+        );
+        ensure!(
+            allowed.contains(&"unshare"),
+            "cosmos seccomp must allow unshare for the in-container OCI runtime"
+        );
+        let denied: Vec<&str> = parsed["syscalls"]
+            .as_array()
+            .context("syscalls")?
+            .iter()
+            .filter(|rule| rule["action"] == "SCMP_ACT_ERRNO")
+            .flat_map(|rule| rule["names"].as_array().into_iter().flatten())
+            .filter_map(|n| n.as_str())
+            .collect();
+        ensure!(denied.contains(&"ptrace"), "ptrace must stay denied");
+        ensure!(denied.contains(&"bpf"), "bpf must stay denied");
+        ensure!(
+            denied.contains(&"kexec_load"),
+            "kexec_load must stay denied"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_security_opts_keeps_one_entry_per_key() -> Result<()> {
+        let merged = merge_security_opts(
+            vec![
+                "no-new-privileges:true".to_string(),
+                "apparmor=celestia-cherino-fuse".to_string(),
+            ],
+            vec![
+                "no-new-privileges:true".to_string(),
+                "seccomp={\"defaultAction\":\"SCMP_ACT_ERRNO\"}".to_string(),
+            ],
+        );
+        ensure!(
+            merged
+                .iter()
+                .filter(|o| security_opt_key(o) == "no-new-privileges")
+                .count()
+                == 1,
+            "no-new-privileges must not be duplicated: {merged:?}"
+        );
+        ensure!(merged.len() == 3, "exactly three distinct keys: {merged:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn verify_security_opts_accepts_a_reformatted_seccomp_profile() -> Result<()> {
+        // A runtime that re-serializes the profile (key order, whitespace) is
+        // not a downgrade; the check must not fail on formatting.
+        let requested = cosmos_security_opts();
+        let actual: Vec<String> = requested
+            .iter()
+            .map(|opt| {
+                if security_opt_key(opt) == "seccomp" {
+                    let value: serde_json::Value =
+                        serde_json::from_str(security_opt_value(opt)).unwrap();
+                    format!("seccomp={}", serde_json::to_string(&value).unwrap())
+                } else {
+                    opt.clone()
+                }
+            })
+            .chain(std::iter::once("label=extra".to_string()))
+            .collect();
+        ensure!(
+            verify_effective_security_opts(&requested, &actual).is_ok(),
+            "reformatted profile plus an extra opt must verify"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_security_opts_flags_the_pre_change_cosmos_state() -> Result<()> {
+        // The negative control for the detector: the state observed on the live
+        // sandbox before this change — AppArmor + no-new-privileges, no seccomp.
+        let requested = cosmos_security_opts();
+        let actual = vec![
+            "no-new-privileges:true".to_string(),
+            format!("apparmor={}", apparmor::installed_profile_name()),
+        ];
+        let drift = verify_effective_security_opts(&requested, &actual)
+            .expect_err("a container without seccomp must be reported as drift");
+        ensure!(
+            drift.missing == vec!["seccomp".to_string()],
+            "the drift must name seccomp: {drift:?}"
+        );
+        ensure!(
+            drift.summary().contains("seccomp") && !drift.summary().contains("defaultAction"),
+            "the summary names keys only, never the profile body"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_security_opts_flags_a_different_apparmor_profile() -> Result<()> {
+        let requested = cosmos_security_opts();
+        let actual: Vec<String> = requested
+            .iter()
+            .map(|opt| {
+                if security_opt_key(opt) == "apparmor" {
+                    "apparmor=unconfined".to_string()
+                } else {
+                    opt.clone()
+                }
+            })
+            .collect();
+        let drift = verify_effective_security_opts(&requested, &actual)
+            .expect_err("a downgraded AppArmor profile must be reported");
+        ensure!(
+            drift.mismatched == vec!["apparmor".to_string()],
+            "the drift must name apparmor as mismatched: {drift:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_security_opts_flags_a_missing_full_security_opt_set() -> Result<()> {
+        let requested = cosmos_security_opts();
+        let drift = verify_effective_security_opts(&requested, &[])
+            .expect_err("no security opts at all must be reported");
+        ensure!(
+            drift.missing.contains(&"seccomp".to_string())
+                && drift.missing.contains(&"apparmor".to_string()),
+            "both load-bearing keys must be reported: {drift:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_security_opts_accepts_a_resolved_seccomp_path() -> Result<()> {
+        // Docker resolves `seccomp=<path>` into the profile; presence is the
+        // strongest claim available then.
+        let requested = vec!["seccomp=/etc/docker/cosmos.json".to_string()];
+        let actual = vec![format!(
+            "seccomp={}",
+            seccomp::SeccompProfile::Cosmos.to_json_string()?
+        )];
+        ensure!(
+            verify_effective_security_opts(&requested, &actual).is_ok(),
+            "a path request resolved to a profile must verify"
+        );
         Ok(())
     }
 

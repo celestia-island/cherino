@@ -24,6 +24,17 @@ pub enum ContainerError {
         message: String,
     },
 
+    /// The container was created, but the security options it actually runs
+    /// with are not the ones the profile requested. The container is torn down
+    /// before this is returned: a sandbox with a silently downgraded profile
+    /// must never be handed to a caller.
+    #[error("Security profile drift on {container_id}: {drift}")]
+    SecurityProfileDrift {
+        container_id: String,
+        /// Keys only — never the seccomp profile body.
+        drift: String,
+    },
+
     #[error("Commit failed: {0}")]
     CommitFailed(String),
 

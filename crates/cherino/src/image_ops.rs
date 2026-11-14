@@ -228,29 +228,49 @@ pub fn fork_can_reuse_source_image(
     changes.iter().all(|c| {
         // A delete means real content left the layer, so it is never scaffolding
         // even at a mount path (which a live mount makes undeletable anyway).
-        !matches!(c.kind, bollard::models::ChangeType::_2)
-            && is_runtime_scaffold(&c.path, source_mount_destinations, tmpfs)
+        is_runtime_scaffold(&c.kind, &c.path, source_mount_destinations, tmpfs)
     })
 }
 
 /// A diff path that cannot carry container state: an exact tmpfs root of the
 /// source, an exact source mount destination, or a strict ancestor directory of
 /// a source mount destination.
-fn is_runtime_scaffold(path: &str, mount_destinations: &[String], tmpfs_roots: &[String]) -> bool {
+fn is_runtime_scaffold(
+    kind: &bollard::models::ChangeType,
+    path: &str,
+    mount_destinations: &[String],
+    tmpfs_roots: &[String],
+) -> bool {
+    use bollard::models::ChangeType;
     let path = path.trim_end_matches('/');
     if path.is_empty() || path == "/" {
         return false;
     }
+    // A delete means content left the layer; it is never scaffolding.
+    if matches!(kind, ChangeType::_2) {
+        return false;
+    }
+    // A mount root itself is a stub: the layer holds at most an empty dir there.
     if tmpfs_roots
         .iter()
         .any(|root| root.trim_end_matches('/') == path)
     {
         return true;
     }
-    mount_destinations.iter().any(|dest| {
+    let exact_dest = |dest: &str| {
         let dest = dest.trim_end_matches('/');
-        !dest.is_empty() && (dest == path || dest.starts_with(&format!("{path}/")))
-    })
+        !dest.is_empty() && dest == path
+    };
+    if mount_destinations.iter().any(|d| exact_dest(d)) {
+        return true;
+    }
+    // An ANCESTOR of a mount destination is scaffolding only when it was merely
+    // created to host the mount. A modified (`_0`) ancestor can carry a mode or
+    // owner change that a commit would keep, so it forces a commit.
+    matches!(kind, ChangeType::_1)
+        && mount_destinations
+            .iter()
+            .any(|dest| dest.trim_end_matches('/').starts_with(&format!("{path}/")))
 }
 
 /// `repo:tag` → (`repo`, `tag`); a bare repository resolves to `latest`, the
@@ -402,7 +422,14 @@ impl ContainerManager {
         &self,
         params: &ContainerForkParams,
         image_tag: &str,
+        requested: bool,
     ) -> Option<SourceForkFacts> {
+        // Skipping the probes when the caller did not opt in is a cost decision
+        // only: the decision below receives the real `requested` value, so a
+        // polarity flip there stays observable in the unit tests.
+        if !requested {
+            return None;
+        }
         let facts = match self.source_fork_facts(&params.source_container_id).await {
             Ok(facts) => facts,
             Err(e) => {
@@ -438,15 +465,8 @@ impl ContainerManager {
                 return None;
             }
         };
-        if NonRepresentableConfig::from_image_config(image_config.as_ref())
-            != facts.non_representable
-        {
-            warn!(
-                container = %params.source_container_id,
-                "fork: source container config differs from its image where a tag cannot carry it, taking the commit path"
-            );
-            return None;
-        }
+        let configs_match = NonRepresentableConfig::from_image_config(image_config.as_ref())
+            == facts.non_representable;
 
         let changes = match self
             .container_filesystem_changes_checked(&params.source_container_id)
@@ -470,13 +490,13 @@ impl ContainerManager {
             }
         };
         if !fast_path_allowed(&FastPathInputs {
-            requested: true,
+            requested,
             diff: Some(&changes),
             source_mounts: &facts.mount_destinations,
             source_tmpfs: &facts.tmpfs_roots,
             read_only_rootfs: facts.read_only_rootfs,
             image_id: Some(facts.image_id.as_str()),
-            configs_match: true,
+            configs_match,
             healthcheck_carryable: facts.healthcheck_carryable,
         }) {
             return None;
@@ -539,11 +559,9 @@ impl ContainerManager {
         // commit would mint an image identical to the source image at ~0.95 s of
         // daemon work. Tag the source image under the fork tag instead so
         // `remove_with_image` keeps its `cosmos-fork-*` cleanup contract.
-        let fast_facts = if options.clean_layer {
-            self.reuse_source_image_if_clean(params, &image_tag).await
-        } else {
-            None
-        };
+        let fast_facts = self
+            .reuse_source_image_if_clean(params, &image_tag, options.clean_layer)
+            .await;
         let reuse_source_image = fast_facts.is_some();
 
         if !reuse_source_image {
@@ -1106,8 +1124,8 @@ mod tests {
 
     #[test]
     fn root_and_empty_paths_are_never_scaffolding() {
-        assert!(!is_runtime_scaffold("/", &[], &no_tmpfs()));
-        assert!(!is_runtime_scaffold("", &[], &no_tmpfs()));
+        assert!(!is_runtime_scaffold(&ChangeType::_1, "/", &[], &no_tmpfs()));
+        assert!(!is_runtime_scaffold(&ChangeType::_1, "", &[], &no_tmpfs()));
     }
 
     /// The tag path inherits Cmd/Entrypoint/ExposedPorts/Volumes/StopSignal from the
@@ -1280,6 +1298,49 @@ mod tests {
     }
 
     #[test]
+    /// A *modified* ancestor can carry a mode/owner change a commit would keep, so
+    /// only an added ancestor is scaffolding.
+    #[test]
+    fn a_modified_ancestor_is_not_scaffolding() {
+        let mounts = dests(&["/celestia/entelecheia"]);
+        assert!(is_runtime_scaffold(
+            &ChangeType::_1,
+            "/celestia",
+            &mounts,
+            &no_tmpfs()
+        ));
+        assert!(!is_runtime_scaffold(
+            &ChangeType::_0,
+            "/celestia",
+            &mounts,
+            &no_tmpfs()
+        ));
+        assert!(is_runtime_scaffold(
+            &ChangeType::_0,
+            "/celestia/entelecheia",
+            &mounts,
+            &no_tmpfs()
+        ));
+    }
+
+    /// `with_clean_layer` is the only way an external caller can enable the
+    /// feature (the struct is `#[non_exhaustive]`), so its polarity is pinned.
+    #[test]
+    fn with_clean_layer_sets_and_reads_the_gate() {
+        assert!(!ForkOptions::default().clean_layer_enabled());
+        assert!(
+            ForkOptions::default()
+                .with_clean_layer(true)
+                .clean_layer_enabled()
+        );
+        assert!(
+            !ForkOptions::default()
+                .with_clean_layer(true)
+                .with_clean_layer(false)
+                .clean_layer_enabled()
+        );
+    }
+
     fn split_repo_tag_handles_bare_and_tagged_refs() {
         assert_eq!(
             split_repo_tag("cosmos-fork-0190"),

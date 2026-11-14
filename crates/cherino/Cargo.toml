@@ -21,7 +21,7 @@ cli-backend = []
 docker-tests = ["docker"]
 
 [dependencies]
-cherino-macros = { path = "../cherino-macros", version = "0.1.0" }
+cherino-macros = { path = "../cherino-macros", version = "0.2" }
 anyhow = "^1"
 async-trait = "^0.1"
 bollard = { version = "^0.21", optional = true }

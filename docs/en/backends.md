@@ -77,6 +77,14 @@ layer (Cosmos) runs *inside* the scepter container and uses Youki to create
 lightweight, fast-start sandboxed containers for agent execution, each with
 its own seccomp profile and resource limits.
 
+One caveat since 2026-11-15: `libcontainer 0.7` mounts only through the fd-based
+API (`open_tree`/`mount_setattr`/`move_mount`, `fsopen`/`fsconfig`/`fsmount`), and
+AppArmor does not mediate that API on kernel 6.1 — so a container running under
+the `Cosmos` seccomp profile (which denies it, correctly) cannot host the inner
+layer: its first inner mount fails with `EPERM`. See `security.md`; the two are
+reconcilable only with an LSM that mediates the fd-based API, or an inner runtime
+that uses classic `mount(2)`.
+
 ## Feature flags
 
 `cherino`:

@@ -6,6 +6,29 @@
 //! `seccomp=...` Docker `security_opt`, or converted to the OCI `LinuxSeccomp`
 //! spec by the `container_runtime` crate.
 //!
+//! # Profiles
+//!
+//! [`SeccompProfile::EntelecheiaDefault`] is the workload default: no `mount`,
+//! no kernel surface. [`SeccompProfile::Cosmos`] is the same filter with the two
+//! syscalls the in-container FUSE rootfs probe needs re-allowed — see
+//! [`SeccompProfileData::cosmos`]. Note what the default does **not** claim:
+//! `clone`/`clone3` are allow-listed without argument filtering, so namespace
+//! *creation* via clone flags is reachable (the boundary there is AppArmor and
+//! the absence of `mount`, not this list); only the standalone `unshare(2)` is
+//! denied by default.
+//!
+//! # Layering with AppArmor
+//!
+//! The two mechanisms answer different questions and both are load-bearing:
+//! seccomp decides **which syscalls** exist for the process; AppArmor
+//! (`crate::apparmor`, profile `celestia-cherino-fuse`) decides **which mounts**
+//! are permitted (`fstype=fuse.*`, `overlay`, `proc`, `sysfs`, `cgroup`, plus
+//! docker-default's remount rules). A seccomp rule cannot express "only FUSE
+//! mounts": the filter may only compare scalar arguments and `mount(2)`'s
+//! `fstype`/`target` are pointers. Allowing `mount` here without the matching
+//! AppArmor profile would be unconfined mounting, so the two profiles are
+//! always applied together (see `security_profile::cosmos`).
+//!
 //! # DEV-ONLY escape hatch
 //!
 //! The `DISABLE_SECCOMP` environment variable (see [`is_seccomp_disabled`])
@@ -78,6 +101,9 @@ pub enum SeccompProfile {
     #[default]
     EntelecheiaDefault,
     Compile,
+    /// The cosmos sandbox preset: the default filter with the in-container
+    /// two classic-mount syscalls re-allowed. See [`SeccompProfileData::cosmos`].
+    Cosmos,
 }
 
 impl SeccompProfile {
@@ -85,6 +111,7 @@ impl SeccompProfile {
         match self {
             Self::EntelecheiaDefault => SeccompProfileData::entelecheia_default(),
             Self::Compile => SeccompProfileData::compile(),
+            Self::Cosmos => SeccompProfileData::cosmos(),
         }
     }
 
@@ -374,13 +401,14 @@ impl SeccompProfileData {
                         "uname".into(),
                         "unlink".into(),
                         "unlinkat".into(),
-                        // `unshare` is intentionally NOT allow-listed: it creates
-                        // new namespaces and becomes an escape vector when combined
-                        // with SYS_ADMIN (which cosmos/scepter re-add). No
-                        // in-container code demonstrably needs it — namespace
-                        // creation for sub-containers is performed by the container
-                        // runtime on the host, outside the sandbox — so it falls
-                        // through to the deny-by-default action instead.
+                        // `unshare` is intentionally NOT allow-listed here: it
+                        // creates new namespaces and becomes an escape vector when
+                        // combined with SYS_ADMIN (which cosmos re-adds). Note the
+                        // limit of this statement: `clone`/`clone3` are allowed
+                        // above without argument filtering, so namespace creation
+                        // through clone flags stays reachable — this list is not
+                        // a namespace boundary, and the profiles do not claim to
+                        // be one.
                         "utime".into(),
                         "utimensat".into(),
                         "utimes".into(),
@@ -445,9 +473,106 @@ impl SeccompProfileData {
         profile
     }
 
+    /// The cosmos sandbox filter: [`Self::entelecheia_default`] plus the two
+    /// syscalls the in-container FUSE rootfs probe needs
+    /// ([`COSMOS_FUSE_PROBE_SYSCALLS`]).
+    ///
+    /// **The documented reason for this list** is `cherino-runtime`'s rootfs
+    /// capability probe: `detect_rootfs_capability` spawns `fuse-overlayfs -o
+    /// lowerdir=…,upperdir=…,workdir=… MERGED` (and `mount -t overlay overlay …`
+    /// as the kernel-overlay fallback). `fuse-overlayfs` runs as root in the
+    /// container, so libfuse issues classic `mount(2)` itself — the setuid
+    /// `fusermount3` path is inert under `no-new-privileges`.
+    ///
+    /// Be precise about the deployed shape, though: that probe is **exported but
+    /// never called** in cherino, `cherino-runtime`, plana or entelecheia, and a
+    /// cosmos container is created with `devices: Vec::new()` — `/dev/fuse` is not
+    /// passed to it, so the FUSE branch could not run there even if something
+    /// called it. In the shape that ships, nothing inside cherino consumes
+    /// `mount`/`umount2`; they are available to the agent's own tool use, which is
+    /// the honest justification for granting the syscall at all. Dropping them is
+    /// a tightening that needs live re-verification of whatever the agent
+    /// workload actually calls — deliberately not done here.
+    ///
+    /// **Not justified, and therefore not here: the inner OCI runtime.** The
+    /// Layer-5 sandbox (`libcontainer 0.7`, the crate `cherino-runtime` links)
+    /// mounts every filesystem through the fd-based API —
+    /// `open_tree`/`mount_setattr`/`move_mount` for binds,
+    /// `fsopen`/`fsconfig`/`fsmount`/… otherwise, with no classic fallback
+    /// (`libcontainer-0.7.0/src/rootfs/mount.rs`) — and AppArmor does not
+    /// mediate that API on kernel 6.1, so admitting it would reopen the
+    /// mount-authority bypass this profile exists to close.
+    ///
+    /// For accuracy about *why* it fails, derived from `libcontainer-0.7.0`
+    /// source rather than from a summary: `RootFS::prepare_rootfs`
+    /// (`rootfs/rootfs.rs:95`) first calls `mount_to_rootfs` (`:34`), which
+    /// performs three classic `mount(2)` calls before the spec loop — the `/`
+    /// propagation remount
+    /// (`:51-61`), `Mount::make_parent_mount_private(rootfs)` (`:65`, itself a
+    /// classic `mount` at `rootfs/mount.rs:557`) and the rootfs self-bind
+    /// (`:68-75`, `MS_BIND|MS_REC`) — and only then iterates the OCI spec's
+    /// mounts through `mounter.setup_mount` (`:87-89`), which is the fd-based
+    /// path. The first spec mount fails with EPERM and `?` aborts
+    /// `prepare_rootfs`, so everything after it never runs: the device binds
+    /// (`rootfs/rootfs.rs:119-121` → `rootfs/device.rs:127`, classic) and the
+    /// init-process mounts (`process/init/process.rs:211,523,542,591,707,729`,
+    /// classic) are unreachable once the filter denies the fd API. Net effect:
+    /// three classic calls succeed, the fd-based call fails, and the runtime
+    /// aborts before touching a device node — more fail-closed than a plain
+    /// "mounts fail" description suggests.
+    pub fn cosmos() -> Self {
+        let mut profile = Self::entelecheia_default();
+        for rule in &mut profile.syscalls {
+            match rule.action.as_str() {
+                "SCMP_ACT_ALLOW" => {
+                    for name in COSMOS_FUSE_PROBE_SYSCALLS {
+                        insert_sorted(&mut rule.names, name);
+                    }
+                }
+                "SCMP_ACT_ERRNO" => rule
+                    .names
+                    .retain(|name| !COSMOS_FUSE_PROBE_SYSCALLS.contains(&name.as_str())),
+                _ => {}
+            }
+        }
+        profile
+    }
+
     pub fn to_json_string(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self)
     }
+}
+
+/// The syscalls the in-container FUSE rootfs probe needs, and that a plain
+/// workload does not.
+///
+/// Re-allowed for cosmos containers **only**. Both are mediated by AppArmor on
+/// the classic path (measured: `mount(2)` of `tmpfs` under
+/// `celestia-cherino-fuse` returns `EACCES`, while `fstype=fuse.*`/`overlay`
+/// succeed — see [`SeccompProfileData::cosmos`]), so this grants the syscall,
+/// not the authority.
+///
+/// **The fd-based mount API is deliberately absent** — `fsopen`, `fsconfig`,
+/// `fsmount`, `move_mount`, `open_tree`, `mount_setattr` are not AppArmor-
+/// mediated on kernel 6.1 (measured 2026-11-15: classic `mount(2)` of tmpfs is
+/// refused with EACCES under the installed profile while
+/// `fsopen`→`fsconfig(CREATE)`→`fsmount`→`move_mount` of the same tmpfs succeeds
+/// and appears in `/proc/mounts`, and `open_tree(OPEN_TREE_CLONE)` of `/etc`
+/// succeeds). Their absence is also why the inner OCI runtime is unsupported
+/// here — `libcontainer 0.7` mounts only through that API.
+pub const COSMOS_FUSE_PROBE_SYSCALLS: &[&str] = &["mount", "umount2"];
+
+/// Inserts a name at its sorted position, keeping an allow-list readable and
+/// making a re-run idempotent.
+fn insert_sorted(names: &mut Vec<String>, name: &str) {
+    if names.iter().any(|existing| existing == name) {
+        return;
+    }
+    let at = names
+        .iter()
+        .position(|existing| existing.as_str() > name)
+        .unwrap_or(names.len());
+    names.insert(at, name.to_string());
 }
 
 #[cfg(test)]
@@ -581,12 +706,16 @@ mod tests {
 
     #[test]
     fn unshare_not_allow_or_deny_listed() -> Result<()> {
-        // `unshare` is an escape vector: it must appear in NEITHER the
-        // allow-list NOR the explicit deny-list of any profile, relying on the
-        // deny-by-default action (SCMP_ACT_ERRNO) to block it.
+        // `unshare` is an escape vector: it appears in NEITHER the allow-list NOR
+        // the explicit deny-list, relying on the deny-by-default action
+        // (SCMP_ACT_ERRNO) to block it. Asserted for every preset — Cosmos used
+        // to allow the namespace family while it was scoped to the inner OCI
+        // runtime, and that half was retracted (see `SeccompProfileData::cosmos`),
+        // so the loop covers all three to keep it that way.
         for profile in [
             SeccompProfile::EntelecheiaDefault.to_profile_data(),
             SeccompProfile::Compile.to_profile_data(),
+            SeccompProfile::Cosmos.to_profile_data(),
         ] {
             let allow_rule = profile
                 .syscalls
@@ -607,6 +736,189 @@ mod tests {
                 "unshare must not be explicitly deny-listed (rely on default deny)"
             );
         }
+        Ok(())
+    }
+
+    fn rule<'a>(profile: &'a SeccompProfileData, action: &str) -> Result<&'a SeccompSyscallRule> {
+        profile
+            .syscalls
+            .iter()
+            .find(|r| r.action == action)
+            .with_context(|| format!("{action} rule expected"))
+    }
+
+    #[test]
+    fn cosmos_profile_allows_exactly_the_fuse_probe_syscalls() -> Result<()> {
+        let profile = SeccompProfile::Cosmos.to_profile_data();
+        let allow = rule(&profile, "SCMP_ACT_ALLOW")?;
+        let deny = rule(&profile, "SCMP_ACT_ERRNO")?;
+        for name in COSMOS_FUSE_PROBE_SYSCALLS.iter().copied() {
+            ensure!(
+                allow.names.iter().any(|n| n == name),
+                "cosmos profile must allow {name}"
+            );
+            ensure!(
+                !deny.names.iter().any(|n| n == name),
+                "{name} must not also be deny-listed (first-match-wins runtimes would deny it)"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cosmos_profile_adds_exactly_mount_and_umount2() -> Result<()> {
+        // Pinned literally, not through the const: a test that reads the same
+        // list it is validating can never notice the list changing.
+        let default = SeccompProfile::EntelecheiaDefault.to_profile_data();
+        let cosmos = SeccompProfile::Cosmos.to_profile_data();
+        let allow = rule(&cosmos, "SCMP_ACT_ALLOW")?;
+        let default_allow = rule(&default, "SCMP_ACT_ALLOW")?;
+        let added: Vec<&str> = allow
+            .names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !default_allow.names.iter().any(|n| n == name))
+            .collect();
+        ensure!(
+            added == vec!["mount", "umount2"],
+            "the cosmos preset must add exactly [mount, umount2], got {added:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cosmos_profile_keeps_the_kernel_escape_surface_denied() -> Result<()> {
+        // The point of the whole change: the probe's classic mounts become reachable,
+        // and the kernel-attack surface stays shut.
+        let profile = SeccompProfile::Cosmos.to_profile_data();
+        let allow = rule(&profile, "SCMP_ACT_ALLOW")?;
+        let deny = rule(&profile, "SCMP_ACT_ERRNO")?;
+        for name in [
+            "ptrace",
+            "bpf",
+            "kexec_load",
+            "kexec_file_load",
+            "init_module",
+            "finit_module",
+            "delete_module",
+            "add_key",
+            "keyctl",
+            "request_key",
+            "perf_event_open",
+            "userfaultfd",
+            "process_vm_readv",
+            "process_vm_writev",
+            "reboot",
+            "swapon",
+            "swapoff",
+            // The fd-based mount API: not AppArmor-mediated on kernel 6.1, so it
+            // must stay on the deny-by-default floor even though it is a "mount".
+            // (It is also why the inner OCI runtime is unsupported here.)
+            "fsopen",
+            "fsconfig",
+            "fsmount",
+            "move_mount",
+            "open_tree",
+            "mount_setattr",
+            // The namespace family went away with the OCI half: nothing in the
+            // supported configuration creates namespaces in-container.
+            "unshare",
+            "setns",
+            "pivot_root",
+            "chroot",
+            "sethostname",
+        ] {
+            ensure!(
+                !allow.names.iter().any(|n| n == name),
+                "{name} must never be allow-listed in the cosmos profile"
+            );
+        }
+        for name in [
+            "ptrace",
+            "bpf",
+            "kexec_load",
+            "kexec_file_load",
+            "init_module",
+            "perf_event_open",
+            "userfaultfd",
+            "process_vm_readv",
+        ] {
+            ensure!(
+                deny.names.iter().any(|n| n == name),
+                "{name} must stay explicitly deny-listed"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cosmos_profile_differs_from_default_only_in_the_declared_family() -> Result<()> {
+        // Guards against silent drift: the cosmos preset is the default filter
+        // plus exactly COSMOS_FUSE_PROBE_SYSCALLS, nothing else.
+        let default = SeccompProfile::EntelecheiaDefault.to_profile_data();
+        let cosmos = SeccompProfile::Cosmos.to_profile_data();
+        let names_in = |profile: &SeccompProfileData, action: &str| -> Result<Vec<String>> {
+            let mut names = rule(profile, action)?.names.clone();
+            names.sort();
+            Ok(names)
+        };
+        for action in ["SCMP_ACT_ALLOW", "SCMP_ACT_ERRNO"] {
+            let mut expected = names_in(&default, action)?;
+            let actual = names_in(&cosmos, action)?;
+            for name in COSMOS_FUSE_PROBE_SYSCALLS.iter().copied() {
+                if action == "SCMP_ACT_ALLOW" {
+                    if !expected.iter().any(|n| n == name) {
+                        expected.push(name.to_string());
+                    }
+                } else {
+                    expected.retain(|n| n != name);
+                }
+            }
+            expected.sort();
+            ensure!(
+                expected == actual,
+                "{action} rule drift: cosmos differs from default outside COSMOS_FUSE_PROBE_SYSCALLS \
+                 (expected {expected:?}, got {actual:?})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn no_profile_lists_one_syscall_in_both_rules() -> Result<()> {
+        for profile in [
+            SeccompProfile::EntelecheiaDefault.to_profile_data(),
+            SeccompProfile::Compile.to_profile_data(),
+            SeccompProfile::Cosmos.to_profile_data(),
+        ] {
+            let allow = rule(&profile, "SCMP_ACT_ALLOW")?;
+            let deny = rule(&profile, "SCMP_ACT_ERRNO")?;
+            for name in &deny.names {
+                ensure!(
+                    !allow.names.iter().any(|n| n == name),
+                    "{name} is both allowed and denied; rule order would decide it silently"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cosmos_profile_serializes_to_a_docker_consumable_json() -> Result<()> {
+        let json = SeccompProfile::Cosmos.to_json_string()?;
+        let parsed: serde_json::Value = serde_json::from_str(&json)?;
+        ensure!(
+            parsed["defaultAction"] == "SCMP_ACT_ERRNO",
+            "deny-by-default action"
+        );
+        ensure!(
+            parsed["architectures"]
+                .as_array()
+                .is_some_and(|a| a.len() == 4),
+            "four architectures"
+        );
+        let syscalls = parsed["syscalls"].as_array().context("syscalls array")?;
+        ensure!(syscalls.len() == 2, "one allow rule and one deny rule");
         Ok(())
     }
 }

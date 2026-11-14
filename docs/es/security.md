@@ -1,5 +1,7 @@
 # Seguridad
 
+> ⚠️ This translation predates the 2026-11-15 seccomp boundary change. `docs/en/security.md` is authoritative for the seccomp/AppArmor sections until this file is re-synced.
+
 Cherino aplica defensa en profundidad a los contenedores aislados mediante una
 capa compartida de perfiles de seguridad. Los mismos tipos de política son
 consumidos por todos los backends, de modo que los runtimes Docker y Youki

@@ -12,7 +12,7 @@ categories = ["os::linux-apis"]
 publish = true
 
 [dependencies]
-cherino = { path = "../cherino", version = "0.1.0", default-features = false }
+cherino = { path = "../cherino", version = "0.2", default-features = false }
 # Read-only archive pre-scan (tar-validate, 2026-11-15): iterate members
 # WITHOUT extracting, so hostile names/links are rejected before GNU tar
 # ever sees them. flate2 ships the pure-Rust miniz_oxide backend by default.

@@ -39,7 +39,83 @@ fn default_network() -> String {
         .unwrap_or_else(|| DEFAULT_NETWORK.to_string())
 }
 
+/// Outcome of the post-start security self-check. Transport failures are kept
+/// apart from real drift so a flaky inspect never reads as "the profile was
+/// downgraded".
+enum ProfileCheck {
+    /// Every requested option is recorded on the container.
+    Applied,
+    /// The container is missing something it was asked for (keys only).
+    Drift(String),
+}
+
 impl ContainerManager {
+    /// Asserts that the live container carries every security option the
+    /// profile requested (see `security_profile::verify_effective_security_opts`
+    /// for the comparison: by key, JSON-wise for `seccomp`, supersets allowed).
+    ///
+    /// This is a startup self-check, not a policy: it never adds options and
+    /// never loosens anything. It exists because a silently dropped
+    /// `seccomp=`/`apparmor=` entry is indistinguishable from a healthy
+    /// container once the workload is running.
+    async fn verify_security_profile(
+        &self,
+        container_id: &str,
+        requested: &[String],
+    ) -> ContainerResult<ProfileCheck> {
+        let inspected = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }
+                ) {
+                    ContainerError::NotFound(container_id.to_string())
+                } else {
+                    ContainerError::from(e)
+                }
+            })?;
+        let actual = inspected
+            .host_config
+            .and_then(|host| host.security_opt)
+            .unwrap_or_default();
+        Ok(
+            match security_profile::verify_effective_security_opts(requested, &actual) {
+                Ok(()) => ProfileCheck::Applied,
+                Err(drift) => ProfileCheck::Drift(drift.summary()),
+            },
+        )
+    }
+
+    /// Best-effort teardown of a container whose security profile could not be
+    /// confirmed. The removal error is logged rather than discarded silently:
+    /// the caller is told the create failed, and an operator needs to know if a
+    /// container outlived that.
+    async fn remove_after_failed_security_check(&self, container_id: &str) {
+        if let Err(error) = self
+            .docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            warn!(
+                container_id,
+                error = %error,
+                "removal after a failed security check also failed — the container may still exist"
+            );
+        }
+    }
+
     pub async fn create(&self, params: &ContainerCreateParams) -> ContainerResult<ContainerInfo> {
         // The default bridge network is deployment-specific; the generic
         // CONTAINER_NETWORK env override wins, the legacy entelecheia-network
@@ -86,7 +162,9 @@ impl ContainerManager {
             pids_limit: params.pids_limit,
             cap_drop: Some(cap_drop),
             cap_add: params.cap_add.clone(),
-            security_opt: Some(security_opt),
+            // Kept alive past the HostConfig move: the post-start self-check
+            // compares against exactly what was requested here.
+            security_opt: Some(security_opt.clone()),
             readonly_rootfs: params.read_only_rootfs,
             group_add: params.group_add.clone(),
             devices: if params.devices.is_empty() {
@@ -163,6 +241,32 @@ impl ContainerManager {
             ..Default::default()
         };
 
+        // Request-shape check before anything is created: a seccomp profile that
+        // admits `mount` without a named AppArmor profile would "apply cleanly"
+        // and leave mount(2) unscoped, so it must never be started at all (the
+        // post-start check compares the request with the daemon's echo and would
+        // happily confirm a boundary that does not exist).
+        match security_profile::decide_security_request(
+            &security_opt,
+            security_profile::DevHatches::from_env(),
+            security_profile::grants_mount_capability(params.cap_add.as_deref()),
+        ) {
+            security_profile::RequestDecision::Proceed { hatch: None } => {}
+            security_profile::RequestDecision::Proceed { hatch: Some(hatch) } => {
+                warn!(
+                    container = %params.name,
+                    hatch,
+                    "DEV-ONLY escape hatch is open: mount mediation is unverified for this container"
+                );
+            }
+            security_profile::RequestDecision::Refuse(reason) => {
+                return Err(ContainerError::SecurityProfileDrift {
+                    container_id: params.name.clone(),
+                    drift: reason,
+                });
+            }
+        }
+
         let create_options = CreateContainerOptions {
             name: Some(params.name.clone()),
             ..Default::default()
@@ -206,6 +310,47 @@ impl ContainerManager {
                 )
                 .await;
             return Err(e.into());
+        }
+
+        // Startup self-check: a runtime that drops or rewrites a security option
+        // downgrades the sandbox without failing, and the downgrade is invisible
+        // from inside the running container (the live sandbox that prompted R2
+        // carried AppArmor but no seccomp while its profile claimed otherwise).
+        // Compare what the runtime actually recorded against what the profile
+        // requested, and tear the container down on any drift: a caller must
+        // never receive a sandbox whose profile is weaker than declared.
+        match self
+            .verify_security_profile(&response.id, &security_opt)
+            .await
+        {
+            Ok(ProfileCheck::Applied) => {}
+            // The check could not run (transport/API failure, or the container
+            // vanished): fail closed, but report the real cause instead of
+            // calling a 500 "profile drift" and tearing down a container that
+            // may be perfectly healthy.
+            Err(error) => {
+                warn!(
+                    container = %params.name,
+                    container_id = %response.id,
+                    error = %error,
+                    "security profile could not be verified — removing the container"
+                );
+                self.remove_after_failed_security_check(&response.id).await;
+                return Err(error);
+            }
+            Ok(ProfileCheck::Drift(drift)) => {
+                warn!(
+                    container = %params.name,
+                    container_id = %response.id,
+                    error = %drift,
+                    "security profile drift — removing the container instead of returning it"
+                );
+                self.remove_after_failed_security_check(&response.id).await;
+                return Err(ContainerError::SecurityProfileDrift {
+                    container_id: response.id.clone(),
+                    drift,
+                });
+            }
         }
 
         if !network.is_empty() {

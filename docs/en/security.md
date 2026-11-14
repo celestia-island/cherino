@@ -28,6 +28,44 @@ and `build_security_opts` renders a profile into `security_opt` entries for
 the container config. Seccomp filtering is the first line of defence: it
 constrains which syscalls a sandboxed workload may make at all.
 
+Three profiles cover the preset families: `EntelecheiaDefault` (a plain
+workload: no `mount`), `Compile` (the default with `userfaultfd` removed from the explicit deny rule — a
+redundant entry, since the denying default action already refuses it: the profile
+exists for intent and for a filter compiled without that rule, not because it
+changes behaviour today) and `Cosmos`
+(the default **plus** `mount` and `umount2`, which the in-container
+`fuse-overlayfs` rootfs probe needs; `ptrace`, `bpf`, `kexec_load`, module
+loading and the keyring calls stay denied).
+
+`Cosmos` deliberately does **not** admit the fd-based mount API
+(`fsopen`/`fsconfig`/`fsmount`/`move_mount`/`open_tree`/`mount_setattr`): AppArmor
+does not mediate that API on kernel 6.1, so admitting it would hand a workload
+the mount authority the AppArmor profile denies on the classic path. One
+consequence is documented as a supported limit rather than a bug: a cosmos
+container that hosts the inner OCI runtime (`libcontainer 0.7`, which mounts only
+through that fd-based API) cannot run under this filter — its first inner mount
+fails closed with `EPERM`.
+
+seccomp cannot express "only FUSE mounts": a filter compares scalar arguments
+and `mount(2)`'s `fstype`/target are pointers. That half of the boundary is
+AppArmor's (below), so a profile that admits `mount` is only safe together with
+the named profile — `security_profile::cosmos_security_opts` emits both, and
+`ContainerManager::create` asserts at startup that the container really carries
+both (`verify_effective_security_opts`).
+
+What the shipped `celestia-cherino-fuse` profile actually constrains is the
+**filesystem type**: `mount fstype=proc`, `sysfs`, `overlay`, `fuse.*` and
+`devpts` carry no `-> target` rule, so a workload may mount those types at a path
+of its choosing; only the `cgroup` mount and the remount family are target-scoped,
+and `umount` is unconditional. The guarantee is "which filesystems may be
+mounted", not "where".
+
+Refusals are loud and immediate: a denied syscall returns `EPERM` to the caller
+(the filter's default action is `SCMP_ACT_ERRNO`), so there is no "quietly
+degraded" mode to debug. The one non-obvious consequence is the inner-OCI case
+described above — `libcontainer`'s first fd-based mount fails with `EPERM` and the
+runtime returns a clean error rather than hanging.
+
 ## AppArmor
 
 Nested containers need to mount FUSE filesystems, which the default AppArmor

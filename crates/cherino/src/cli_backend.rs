@@ -460,6 +460,37 @@ impl ContainerOps for CliContainerBackend {
     // -- Lifecycle --
 
     async fn create(&self, params: &ContainerCreateParams) -> ContainerResult<ContainerInfo> {
+        // The request-shape guard, for a `security_opt` that is present: a list
+        // whose mount mediation is unproven must never reach a runtime. Two
+        // caveats this backend does NOT share with the Docker path, stated rather
+        // than implied — (1) `security_opt: None` skips this block entirely
+        // (the Docker backend substitutes a default profile first, so it always
+        // has a list to check), and (2) there is no post-start inspect/drift
+        // check here because CLI output is not a reliable echo of the applied
+        // profile. So the guard below covers `Some(..)` only, and the post-start
+        // half is absent by design, not by omission.
+        if let Some(requested) = params.security_opt.as_deref() {
+            match crate::security_profile::decide_security_request(
+                requested,
+                crate::security_profile::DevHatches::from_env(),
+                crate::security_profile::grants_mount_capability(params.cap_add.as_deref()),
+            ) {
+                crate::security_profile::RequestDecision::Proceed { hatch: None } => {}
+                crate::security_profile::RequestDecision::Proceed { hatch: Some(hatch) } => {
+                    tracing::warn!(
+                        container = %params.name,
+                        hatch,
+                        "DEV-ONLY escape hatch is open: mount mediation is unverified for this container"
+                    );
+                }
+                crate::security_profile::RequestDecision::Refuse(reason) => {
+                    return Err(ContainerError::SecurityProfileDrift {
+                        container_id: params.name.clone(),
+                        drift: reason,
+                    });
+                }
+            }
+        }
         let arg_strs = CliContainerBackend::build_run_args(params);
         let arg_refs: Vec<&str> = arg_strs.iter().map(|s| s.as_str()).collect();
         let stdout = self.run(&arg_refs).await?;

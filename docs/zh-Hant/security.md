@@ -1,5 +1,7 @@
 # 安全性
 
+> ⚠️ 本譯文早於 2026-11-15 的 seccomp 邊界變更；在重新同步之前，seccomp / AppArmor 章節以 `docs/en/security.md` 為準。
+
 Cherino 透過共用的安全性設定檔層，為沙箱容器實施縱深防禦。
 相同的政策型別被每個 backend 使用，因此 Docker 與 Youki
 runtime 強制執行完全相同的限制。

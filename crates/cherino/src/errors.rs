@@ -24,6 +24,18 @@ pub enum ContainerError {
         message: String,
     },
 
+    /// The security request is not a scoped boundary, or the created container
+    /// does not carry what the profile requested. Nothing is left behind before
+    /// this is returned: the pre-create check refuses before anything exists,
+    /// and the post-start check tears the container down. A sandbox with a
+    /// silently downgraded profile must never reach a caller.
+    #[error("Security profile drift on {container_id}: {drift}")]
+    SecurityProfileDrift {
+        container_id: String,
+        /// Keys only — never the seccomp profile body.
+        drift: String,
+    },
+
     #[error("Commit failed: {0}")]
     CommitFailed(String),
 

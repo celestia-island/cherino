@@ -18,6 +18,32 @@ use super::{
 const COSMOS_FORK_PREFIX: &str = "cosmos-fork-";
 const COSMOS_SNAPSHOT_PREFIX: &str = "cosmos-snapshot-";
 
+impl SourceForkFacts {
+    /// `params.env` over the source's env — the same merge a container gets when it
+    /// is created from an image whose Config carries the source env.
+    fn merged_env(&self, params: &ContainerForkParams) -> HashMap<String, String> {
+        let mut env: HashMap<String, String> = self
+            .env
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for (k, v) in &params.env {
+            env.insert(k.clone(), v.clone());
+        }
+        env
+    }
+
+    /// `params.labels` over the source's labels.
+    fn merged_labels(&self, params: &ContainerForkParams) -> HashMap<String, String> {
+        let mut labels = self.labels.clone();
+        for (k, v) in &params.labels {
+            labels.insert(k.clone(), v.clone());
+        }
+        labels
+    }
+}
+
 /// What the fast path needs to know about the source container.
 #[derive(Debug, Clone)]
 struct SourceForkFacts {
@@ -39,6 +65,80 @@ struct SourceForkFacts {
     /// the *image's* probe, and scepter intentionally overrides it (the cosmos
     /// socket-aware check) at container-create time.
     healthcheck: Option<super::types::HealthcheckParams>,
+    /// `Config.Env` of the source container: the fork's env starts from it, with
+    /// `params.env` overriding key by key (docker merges container env over image
+    /// env, so this reproduces the commit path).
+    env: Vec<String>,
+    /// `Config.User` of the source container, used when the caller passes none.
+    user: Option<String>,
+    /// `Config.Labels` of the source container, merged under the caller's labels.
+    labels: HashMap<String, String>,
+    /// Config fields the fork cannot express through `ContainerCreateParams`
+    /// (`Cmd`, `Entrypoint`, `ExposedPorts`, `Volumes`, `StopSignal`). A fork is
+    /// only equivalent if these already match the image, because tag-path forks
+    /// inherit them from the image instead of from the source container.
+    non_representable: NonRepresentableConfig,
+}
+
+/// The slice of a container's Config a fork cannot pass to `create`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NonRepresentableConfig {
+    cmd: Option<Vec<String>>,
+    entrypoint: Option<Vec<String>>,
+    exposed_ports: Option<Vec<String>>,
+    volumes: Option<Vec<String>>,
+    stop_signal: Option<String>,
+}
+
+impl NonRepresentableConfig {
+    fn build(
+        cmd: Option<Vec<String>>,
+        entrypoint: Option<Vec<String>>,
+        mut exposed_ports: Option<Vec<String>>,
+        mut volumes: Option<Vec<String>>,
+        stop_signal: Option<String>,
+    ) -> Self {
+        if let Some(ports) = exposed_ports.as_mut() {
+            ports.sort();
+        }
+        if let Some(v) = volumes.as_mut() {
+            v.sort();
+        }
+        Self {
+            cmd,
+            entrypoint,
+            exposed_ports,
+            volumes,
+            stop_signal,
+        }
+    }
+
+    /// From an image's `Config` (what a tag-path fork inherits).
+    fn from_image_config(config: Option<&bollard::models::ImageConfig>) -> Self {
+        let Some(config) = config else {
+            return Self::default();
+        };
+        Self::build(
+            config.cmd.clone(),
+            config.entrypoint.clone(),
+            config.exposed_ports.clone(),
+            config.volumes.clone(),
+            config.stop_signal.clone(),
+        )
+    }
+
+    fn from_config(config: Option<&bollard::models::ContainerConfig>) -> Self {
+        let Some(config) = config else {
+            return Self::default();
+        };
+        Self::build(
+            config.cmd.clone(),
+            config.entrypoint.clone(),
+            config.exposed_ports.clone(),
+            config.volumes.clone(),
+            config.stop_signal.clone(),
+        )
+    }
 }
 
 /// True when a fork may start from the source container's own image instead of
@@ -219,6 +319,13 @@ impl ContainerManager {
                     start_period_ns: hc.start_period,
                 });
 
+        let env = config.and_then(|c| c.env.clone()).unwrap_or_default();
+        let user = config
+            .and_then(|c| c.user.clone())
+            .filter(|u| !u.trim().is_empty());
+        let labels = config.and_then(|c| c.labels.clone()).unwrap_or_default();
+        let non_representable = NonRepresentableConfig::from_config(config);
+
         Ok(SourceForkFacts {
             image_id: inspect.image.clone().unwrap_or_default(),
             read_only_rootfs: inspect.host_config.as_ref().and_then(|h| h.readonly_rootfs),
@@ -226,6 +333,10 @@ impl ContainerManager {
             tmpfs_roots,
             working_dir,
             healthcheck,
+            env,
+            user,
+            labels,
+            non_representable,
         })
     }
 
@@ -253,6 +364,36 @@ impl ContainerManager {
             }
         };
         // Fail closed: an unreadable diff is "unknown", never "clean".
+        // Cheap preconditions first: an opt-in caller with a writable source (or an
+        // unresolvable image) must not pay a full recursive layer diff only to
+        // commit anyway.
+        if facts.read_only_rootfs != Some(true) || facts.image_id.trim().is_empty() {
+            return None;
+        }
+        // A tag-path fork inherits Cmd/Entrypoint/ExposedPorts/Volumes/StopSignal from
+        // the IMAGE, while a commit-path fork inherits them from the source
+        // container. They are safe only when the two already agree.
+        let image_config = match self.inspect_image_config(&facts.image_id).await {
+            Ok(config) => config,
+            Err(e) => {
+                warn!(
+                    image = %facts.image_id,
+                    error = %e,
+                    "fork: source image inspect failed, taking the commit path"
+                );
+                return None;
+            }
+        };
+        if NonRepresentableConfig::from_image_config(image_config.as_ref())
+            != facts.non_representable
+        {
+            warn!(
+                container = %params.source_container_id,
+                "fork: source container config differs from its image where a tag cannot carry it, taking the commit path"
+            );
+            return None;
+        }
+
         let changes = match self
             .container_filesystem_changes_checked(&params.source_container_id)
             .await
@@ -368,10 +509,16 @@ impl ContainerManager {
             name: params.new_name.clone(),
             image: image_tag.clone(),
             network: params.network.clone(),
-            env: params.env.clone(),
+            env: fast_facts
+                .as_ref()
+                .map(|f| f.merged_env(params))
+                .unwrap_or_else(|| params.env.clone()),
             ports: Vec::new(),
             volumes: params.volumes.clone(),
-            labels: params.labels.clone(),
+            labels: fast_facts
+                .as_ref()
+                .map(|f| f.merged_labels(params))
+                .unwrap_or_else(|| params.labels.clone()),
             // On the fast path the fork image is a tag of the source image, so it
             // does NOT carry the source container's Config. `docker commit` would
             // have baked these in; carry them explicitly instead.
@@ -379,7 +526,10 @@ impl ContainerManager {
             log_driver: None,
             log_opts: HashMap::new(),
             healthcheck: fast_facts.as_ref().and_then(|f| f.healthcheck.clone()),
-            user: params.user.clone(),
+            user: params
+                .user
+                .clone()
+                .or_else(|| fast_facts.as_ref().and_then(|f| f.user.clone())),
             memory_limit: params.memory_limit,
             nano_cpus: params.nano_cpus,
             pids_limit: params.pids_limit,
@@ -454,6 +604,20 @@ impl ContainerManager {
         info!(image = %image, digest = %digest, "image pulled");
 
         Ok(digest)
+    }
+
+    /// The image's own `Config`, used to prove that the fields a tag cannot carry
+    /// already match between the source container and its image.
+    async fn inspect_image_config(
+        &self,
+        image: &str,
+    ) -> ContainerResult<Option<bollard::models::ImageConfig>> {
+        let inspect = self
+            .docker
+            .inspect_image(image)
+            .await
+            .map_err(ContainerError::from)?;
+        Ok(inspect.config)
     }
 
     pub async fn inspect_image_id(&self, image: &str) -> ContainerResult<String> {
@@ -887,6 +1051,34 @@ mod tests {
     fn root_and_empty_paths_are_never_scaffolding() {
         assert!(!is_runtime_scaffold("/", &[], &no_tmpfs()));
         assert!(!is_runtime_scaffold("", &[], &no_tmpfs()));
+    }
+
+    /// The tag path inherits Cmd/Entrypoint/ExposedPorts/Volumes/StopSignal from the
+    /// image, so a difference there must be detected (and force a commit).
+    #[test]
+    fn non_representable_config_detects_a_divergence() {
+        let build = |cmd: Option<Vec<String>>, volumes: Option<Vec<String>>| {
+            NonRepresentableConfig::build(cmd, None, None, volumes, None)
+        };
+        assert_eq!(
+            build(Some(vec!["a".to_string()]), None),
+            build(Some(vec!["a".to_string()]), None)
+        );
+        assert_ne!(
+            build(Some(vec!["a".to_string()]), None),
+            build(Some(vec!["b".to_string()]), None),
+            "a different Cmd must not be considered equivalent"
+        );
+        assert_ne!(
+            build(None, None),
+            build(None, Some(vec!["/v".to_string()])),
+            "a different volume list must not be considered equivalent"
+        );
+        // Ordering is normalised, so the same set compares equal.
+        assert_eq!(
+            build(None, Some(vec!["/b".to_string(), "/a".to_string()])),
+            build(None, Some(vec!["/a".to_string(), "/b".to_string()]))
+        );
     }
 
     #[test]

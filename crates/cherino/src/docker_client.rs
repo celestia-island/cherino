@@ -11,6 +11,9 @@ pub(crate) enum DockerHostTransport {
     Http(String),
     /// `unix:///path/to.sock` — a local unix socket.
     Unix(String),
+    /// `npipe:////./pipe/docker_engine` — a Windows named pipe.
+    #[cfg(windows)]
+    NamedPipe(String),
 }
 
 /// Classify a `DOCKER_HOST` value.
@@ -53,7 +56,32 @@ pub(crate) fn docker_host_transport(
             ))));
         }
     }
+    if lower.starts_with("npipe://") {
+        // Windows named pipes. On other platforms this is an explicit platform
+        // error, never a silent fallback to the local socket.
+        #[cfg(windows)]
+        {
+            if host.len() <= "npipe://".len() {
+                return Err(unsupported_docker_host(raw));
+            }
+            return Ok(Some(DockerHostTransport::NamedPipe(host.to_string())));
+        }
+        #[cfg(not(windows))]
+        {
+            return Err(ContainerError::Connection(format!(
+                "DOCKER_HOST={raw:?} names a Windows named pipe; named pipes are \
+                 Windows-only. On this platform use unix://<path> or tcp://<host>:<port>."
+            )));
+        }
+    }
     if lower.starts_with("unix://") {
+        #[cfg(windows)]
+        {
+            return Err(ContainerError::Connection(format!(
+                "DOCKER_HOST={raw:?} names a unix socket, which is not available on \
+                 Windows. Use npipe:////./pipe/docker_engine (or another pipe)."
+            )));
+        }
         if host.len() <= "unix://".len() {
             return Err(unsupported_docker_host(raw));
         }
@@ -90,6 +118,10 @@ pub(crate) fn dispatch_docker_host(value: Option<&str>) -> ContainerResult<Docke
     match docker_host_transport(value)? {
         Some(DockerHostTransport::Http(host)) => connect_http(&host),
         Some(DockerHostTransport::Unix(path)) => connect_socket(&path),
+        #[cfg(windows)]
+        Some(DockerHostTransport::NamedPipe(pipe)) => {
+            connect_named_pipe(pipe.trim_start_matches("npipe://"))
+        }
         None => Docker::connect_with_local_defaults()
             .map_err(|e| ContainerError::Connection(e.to_string())),
     }
@@ -259,6 +291,19 @@ mod tests {
         }
     }
 
+    /// On every platform except Windows, a named pipe is an explicit platform error
+    /// (previously such a value was silently ignored and the default socket used).
+    #[cfg(not(windows))]
+    #[test]
+    fn named_pipes_are_windows_only() {
+        let err = classify("npipe:////./pipe/docker_engine")
+            .expect_err("a named pipe on unix must be rejected");
+        assert!(
+            format!("{err}").contains("Windows"),
+            "the error must say named pipes are Windows-only: {err}"
+        );
+    }
+
     #[test]
     fn unset_or_blank_keeps_the_default_socket_path() {
         assert!(matches!(docker_host_transport(None), Ok(None)));
@@ -273,7 +318,6 @@ mod tests {
         for value in [
             "fd://",
             "ssh://user@host",
-            "npipe:////./pipe/docker_engine",
             "https://example.invalid:2376",
             "/var/run/docker.sock",
             "unix://",

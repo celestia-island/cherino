@@ -1,5 +1,7 @@
 # セキュリティ
 
+> ⚠️ This translation predates the 2026-11-15 seccomp boundary change. `docs/en/security.md` is authoritative for the seccomp/AppArmor sections until this file is re-synced.
+
 Cherino は共通のセキュリティプロファイルレイヤーを通じて、
 サンドボックス化されたコンテナに対する多層防御 (defence-in-depth) を
 強制します。同一のポリシー型がすべてのバックエンドで消費されるため、

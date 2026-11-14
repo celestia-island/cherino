@@ -101,8 +101,8 @@ pub enum SeccompProfile {
     #[default]
     EntelecheiaDefault,
     Compile,
-    /// The cosmos/scepter preset: the default filter with the in-container
-    /// FUSE/OCI syscall family re-allowed. See [`SeccompProfileData::cosmos`].
+    /// The cosmos sandbox preset: the default filter with the in-container
+    /// two classic-mount syscalls re-allowed. See [`SeccompProfileData::cosmos`].
     Cosmos,
 }
 
@@ -473,7 +473,7 @@ impl SeccompProfileData {
         profile
     }
 
-    /// The cosmos/scepter filter: [`Self::entelecheia_default`] plus the two
+    /// The cosmos sandbox filter: [`Self::entelecheia_default`] plus the two
     /// syscalls the in-container FUSE rootfs probe needs
     /// ([`COSMOS_FUSE_PROBE_SYSCALLS`]).
     ///
@@ -694,7 +694,7 @@ mod tests {
         // For a plain workload `unshare` is an escape vector: it must appear in
         // NEITHER the allow-list NOR the explicit deny-list, relying on the
         // deny-by-default action (SCMP_ACT_ERRNO) to block it. The cosmos preset
-        // is the documented exception (it hosts the Layer-5 OCI runtime) and is
+        // is the documented exception (it hosts namespace-creating code) and is
         // asserted separately below.
         for profile in [
             SeccompProfile::EntelecheiaDefault.to_profile_data(),
@@ -771,8 +771,8 @@ mod tests {
 
     #[test]
     fn cosmos_profile_keeps_the_kernel_escape_surface_denied() -> Result<()> {
-        // The point of the whole change: the FUSE/OCI family becomes reachable,
-        // the kernel-attack surface does not.
+        // The point of the whole change: the probe's classic mounts become reachable,
+        // and the kernel-attack surface stays shut.
         let profile = SeccompProfile::Cosmos.to_profile_data();
         let allow = rule(&profile, "SCMP_ACT_ALLOW")?;
         let deny = rule(&profile, "SCMP_ACT_ERRNO")?;

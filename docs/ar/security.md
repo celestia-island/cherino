@@ -1,5 +1,7 @@
 # الأمان
 
+> ⚠️ This translation predates the 2026-11-15 seccomp boundary change. `docs/en/security.md` is authoritative for the seccomp/AppArmor sections until this file is re-synced.
+
 يفرض Cherino الدفاع المتعدد الطبقات للحاويات المعزولة عبر طبقة
 مشتركة من ملفات الأمان. أنواع السياسة نفسها تستهلكها كل واجهة خلفية،
 بحيث يفرض وقتَا تشغيل Docker وYouki القيود ذاتها.

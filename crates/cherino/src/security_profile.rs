@@ -234,6 +234,66 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
     )
 }
 
+/// Which DEV-ONLY escape hatches are open in this process.
+///
+/// Passed in rather than read from the environment so the decision below stays
+/// unit-testable; [`DevHatches::from_env`] is the production source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DevHatches {
+    /// `DISABLE_SECCOMP` is set: the request carries no seccomp filter.
+    pub seccomp_disabled: bool,
+    /// `CHERINO_APPARMOR_UNCONFINED` (or the legacy name) is set: the request
+    /// carries `apparmor=unconfined`.
+    pub apparmor_unconfined: bool,
+}
+
+impl DevHatches {
+    pub fn from_env() -> Self {
+        Self {
+            seccomp_disabled: crate::seccomp::is_seccomp_disabled(),
+            apparmor_unconfined: crate::apparmor::is_apparmor_unconfined(),
+        }
+    }
+
+    fn any(self) -> Option<&'static str> {
+        if self.seccomp_disabled {
+            Some("DISABLE_SECCOMP")
+        } else if self.apparmor_unconfined {
+            Some("CHERINO_APPARMOR_UNCONFINED")
+        } else {
+            None
+        }
+    }
+}
+
+/// What a create path must do with a caller's `security_opt`, decided without a
+/// container runtime so the wiring has an always-run test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestDecision {
+    /// A scoped boundary; `hatch` names the DEV-ONLY escape hatch that made it
+    /// pass despite unproven mount mediation, when one did.
+    Proceed { hatch: Option<&'static str> },
+    /// Not a scoped boundary: nothing may be created.
+    Refuse(String),
+}
+
+/// The pre-create half of the security self-check.
+///
+/// A request whose `mount` is unproven is refused — unless a DEV-ONLY hatch is
+/// deliberately open, in which case it proceeds with the hatch named so the
+/// caller can make the downgrade loud. The hatches exist to unblock local work;
+/// silently bricking them would be worse than a warning, because the next person
+/// would remove the guard instead of the hatch.
+pub fn decide_security_request(requested: &[String], hatches: DevHatches) -> RequestDecision {
+    match verify_mount_mediation(requested) {
+        Ok(()) => RequestDecision::Proceed { hatch: None },
+        Err(reason) => match hatches.any() {
+            Some(hatch) => RequestDecision::Proceed { hatch: Some(hatch) },
+            None => RequestDecision::Refuse(reason),
+        },
+    }
+}
+
 /// Checks that every requested `security_opt` entry is actually in effect on the
 /// container the runtime created.
 ///
@@ -310,8 +370,8 @@ pub fn cosmos() -> ContainerSecurity {
             "SETUID".to_string(),
             "DAC_OVERRIDE".to_string(),
         ]),
-        // The cosmos filter: deny-by-default with the in-container FUSE/OCI
-        // syscall family re-allowed, paired with the named FUSE-capable AppArmor
+        // The cosmos filter: deny-by-default with the in-container FUSE probe's
+        // two classic-mount syscalls re-allowed, paired with the named FUSE-capable AppArmor
         // profile that decides *which* mounts are permitted. Never one without
         // the other — see [`cosmos_security_opts`].
         security_opt: Some(cosmos_security_opts()),
@@ -865,6 +925,63 @@ mod tests {
             verify_mount_mediation(&opts).is_ok(),
             "a named AppArmor profile is what scopes mount(2)"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn decide_security_request_proceeds_on_the_cosmos_pair() -> Result<()> {
+        ensure!(
+            decide_security_request(&cosmos_security_opts(), DevHatches::default())
+                == RequestDecision::Proceed { hatch: None },
+            "the shipped pair must proceed without a hatch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decide_security_request_refuses_a_mispaired_list() -> Result<()> {
+        let mut opts = seccomp::build_security_opts(Some(seccomp::SeccompProfile::Cosmos));
+        opts.push("apparmor=unconfined".to_string());
+        ensure!(
+            matches!(
+                decide_security_request(&opts, DevHatches::default()),
+                RequestDecision::Refuse(_)
+            ),
+            "an unproven list must be refused without a hatch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decide_security_request_honours_the_dev_hatches() -> Result<()> {
+        // The hatches exist to unblock local work; a silently bricked hatch is
+        // how someone deletes the guard at 3am, so they proceed — named, so the
+        // caller can make the downgrade loud.
+        let unpaired = vec!["no-new-privileges:true".to_string()];
+        for (hatches, expected) in [
+            (
+                DevHatches {
+                    seccomp_disabled: true,
+                    apparmor_unconfined: false,
+                },
+                "DISABLE_SECCOMP",
+            ),
+            (
+                DevHatches {
+                    seccomp_disabled: false,
+                    apparmor_unconfined: true,
+                },
+                "CHERINO_APPARMOR_UNCONFINED",
+            ),
+        ] {
+            ensure!(
+                decide_security_request(&unpaired, hatches)
+                    == RequestDecision::Proceed {
+                        hatch: Some(expected)
+                    },
+                "hatch {expected} must let the request through, named"
+            );
+        }
         Ok(())
     }
 

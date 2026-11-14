@@ -246,12 +246,25 @@ impl ContainerManager {
         // and leave mount(2) unscoped, so it must never be started at all (the
         // post-start check compares the request with the daemon's echo and would
         // happily confirm a boundary that does not exist).
-        security_profile::verify_mount_mediation(&security_opt).map_err(|reason| {
-            ContainerError::SecurityProfileDrift {
-                container_id: params.name.clone(),
-                drift: reason,
+        match security_profile::decide_security_request(
+            &security_opt,
+            security_profile::DevHatches::from_env(),
+        ) {
+            security_profile::RequestDecision::Proceed { hatch: None } => {}
+            security_profile::RequestDecision::Proceed { hatch: Some(hatch) } => {
+                warn!(
+                    container = %params.name,
+                    hatch,
+                    "DEV-ONLY escape hatch is open: mount mediation is unverified for this container"
+                );
             }
-        })?;
+            security_profile::RequestDecision::Refuse(reason) => {
+                return Err(ContainerError::SecurityProfileDrift {
+                    container_id: params.name.clone(),
+                    drift: reason,
+                });
+            }
+        }
 
         let create_options = CreateContainerOptions {
             name: Some(params.name.clone()),

@@ -1,5 +1,7 @@
 # 보안
 
+> ⚠️ This translation predates the 2026-11-15 seccomp boundary change. `docs/en/security.md` is authoritative for the seccomp/AppArmor sections until this file is re-synced.
+
 Cherino는 공유 보안 프로필 레이어를 통해 샌드박스 컨테이너에 대한
 심층 방어(defence-in-depth)를 강제합니다. 동일한 정책 타입이 모든
 백엔드에서 소비되므로, Docker와 Youki 런타임은 동일한 제한을 강제합니다.

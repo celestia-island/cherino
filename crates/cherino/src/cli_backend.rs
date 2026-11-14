@@ -460,6 +460,32 @@ impl ContainerOps for CliContainerBackend {
     // -- Lifecycle --
 
     async fn create(&self, params: &ContainerCreateParams) -> ContainerResult<ContainerInfo> {
+        // Same request-shape guard as the Docker backend: a `security_opt` whose
+        // mount mediation is unproven must never reach a runtime. This backend
+        // has no post-start inspect/drift check (the CLI output is not a reliable
+        // echo of the applied profile), so the pre-create half is the whole
+        // check here — and it is the half that matters for this class of bug.
+        if let Some(requested) = params.security_opt.as_deref() {
+            match crate::security_profile::decide_security_request(
+                requested,
+                crate::security_profile::DevHatches::from_env(),
+            ) {
+                crate::security_profile::RequestDecision::Proceed { hatch: None } => {}
+                crate::security_profile::RequestDecision::Proceed { hatch: Some(hatch) } => {
+                    tracing::warn!(
+                        container = %params.name,
+                        hatch,
+                        "DEV-ONLY escape hatch is open: mount mediation is unverified for this container"
+                    );
+                }
+                crate::security_profile::RequestDecision::Refuse(reason) => {
+                    return Err(ContainerError::SecurityProfileDrift {
+                        container_id: params.name.clone(),
+                        drift: reason,
+                    });
+                }
+            }
+        }
         let arg_strs = CliContainerBackend::build_run_args(params);
         let arg_refs: Vec<&str> = arg_strs.iter().map(|s| s.as_str()).collect();
         let stdout = self.run(&arg_refs).await?;

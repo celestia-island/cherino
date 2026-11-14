@@ -1,5 +1,7 @@
 # Безопасность
 
+> ⚠️ This translation predates the 2026-11-15 seccomp boundary change. `docs/en/security.md` is authoritative for the seccomp/AppArmor sections until this file is re-synced.
+
 Cherino обеспечивает эшелонированную защиту изолированных контейнеров через
 общий слой профилей безопасности. Одни и те же типы политик используются
 каждым бэкендом, поэтому рантаймы Docker и Youki применяют идентичные

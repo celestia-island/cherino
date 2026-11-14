@@ -630,13 +630,18 @@ impl RootfsManager {
             return Ok(());
         }
 
+        // SECURITY (tar-validate): reject hostile members BEFORE any
+        // filesystem effect — an earlier position left an empty dest on
+        // refusal, which pull_image's `dest.is_dir()` short-circuit then
+        // mistook for a cached image (fake success, empty rootfs).
+        Self::validate_tarball(tarball)?;
+
         tokio::fs::create_dir_all(dest)
             .await
             .map_err(|e| ContainerError::OperationFailed {
                 container_id: "rootfs".to_string(),
                 message: format!("mkdir {}: {}", dest.display(), e),
             })?;
-
         let dest_str = dest.to_string_lossy().to_string();
         let tarball_str = tarball.to_string_lossy().to_string();
 
@@ -664,6 +669,195 @@ impl RootfsManager {
         }
 
         Ok(())
+    }
+
+    /// SECURITY (tar-validate, 2026-11-15): read-only pre-scan of a rootfs
+    /// tarball BEFORE GNU tar extracts it. The archive arrives over the
+    /// network (`pull_image`), so "GNU tar refuses bad members on extract"
+    /// was the only line of defense — this makes the check explicit,
+    /// deterministic and testable offline. Rejects:
+    ///   * absolute member names (leading `/`);
+    ///   * any `..` path component;
+    ///   * symlink/hardlink members whose target escapes the extraction
+    ///     root (absolute target, or a `..`-containing relative one);
+    ///   * any member whose path traverses an earlier symlink member
+    ///     that points outside (the classic write-through escape).
+    ///
+    /// Pure decision core over `(kind, name, link_target)` triples so unit
+    /// tests need no archives; [`Self::validate_tarball`] feeds it real ones.
+    pub fn validate_members(members: &[(char, String, Option<String>)]) -> ContainerResult<()> {
+        // Resolve `comps` starting from `base` through the symlink table.
+        // Absolute targets restart at the archive root. Every hop that
+        // would pop above the root is an escape; chained links are
+        // followed with a depth cap (a cycle can only come from a hostile
+        // archive — real images never loop).
+        fn resolve(
+            base: &[String],
+            comps: &[&str],
+            links: &std::collections::HashMap<Vec<String>, (Vec<String>, bool)>,
+            depth: &mut u32,
+        ) -> Result<Vec<String>, String> {
+            *depth += 1;
+            if *depth > 64 {
+                return Err("symlink chain too deep (cycle?)".into());
+            }
+            let mut cur: Vec<String> = base.to_vec();
+            for comp in comps {
+                match *comp {
+                    "" | "." => {}
+                    ".." => {
+                        if cur.pop().is_none() {
+                            return Err("component '..' escapes the archive root".to_string());
+                        }
+                    }
+                    c => {
+                        cur.push(c.to_string());
+                        if let Some((target, absolute)) = links.get(&cur) {
+                            if *absolute {
+                                // The KERNEL resolves an absolute symlink
+                                // target against the HOST root — writing a
+                                // member through it lands outside dest no
+                                // matter what the chroot semantics are at
+                                // runtime. (An absolute link nobody
+                                // traverses is the legitimate rootfs shape
+                                // and stays accepted.)
+                                return Err(
+                                    "member traverses symlink with an absolute target".to_string()
+                                );
+                            }
+                            let t: Vec<&str> = target.iter().map(|x| x.as_str()).collect();
+                            let resolved = resolve(&cur[..cur.len() - 1], &t, links, depth)?;
+                            cur = resolved;
+                        }
+                    }
+                }
+            }
+            Ok(cur)
+        }
+
+        let err = |msg: String| ContainerError::OperationFailed {
+            container_id: "rootfs".into(),
+            message: msg,
+        };
+
+        // Symlink table: CANONICAL path -> raw target components. Canonical
+        // because a symlink may itself live behind another symlink (`/bin`
+        // behind `/bin -> usr/bin`); we register the resolved location.
+        let mut links: std::collections::HashMap<Vec<String>, (Vec<String>, bool)> =
+            std::collections::HashMap::new();
+
+        for (kind, name, target) in members {
+            let path = name.trim_start_matches("./");
+            if path.starts_with('/') {
+                return Err(err(format!("tar member {name:?} is absolute")));
+            }
+            if path.split('/').any(|c| c == "..") {
+                return Err(err(format!("tar member {name:?} contains '..'")));
+            }
+            let comps: Vec<&str> = path
+                .split('/')
+                .filter(|c| !c.is_empty() && *c != ".")
+                .collect();
+
+            match kind {
+                'l' | 'h' => {
+                    let Some(t) = target else {
+                        return Err(err(format!("link member {name:?} has no target")));
+                    };
+                    // Resolve the link's OWN location first (it may sit
+                    // behind an earlier symlink).
+                    let at = resolve(&[], &comps, &links, &mut 0).map_err(err)?;
+                    if *kind == 'h' {
+                        // A hardlink target names another MEMBER: reject any
+                        // escaping shape outright (real members never need
+                        // absolute or '..' paths here).
+                        let tcomps: Vec<&str> = t.split('/').filter(|c| !c.is_empty()).collect();
+                        if t.starts_with('/') || tcomps.contains(&"..") {
+                            return Err(err(format!(
+                                "hardlink {name:?} -> {t:?} names a path outside the archive"
+                            )));
+                        }
+                        let _ = resolve(&[], &tcomps, &links, &mut 0).map_err(err)?;
+                    } else {
+                        // A symlink target may legitimately be absolute
+                        // (rootfs images are FULL of `/bin -> usr/bin`
+                        // shapes — they resolve inside the runtime chroot)
+                        // or contain '..' while staying net-inside
+                        // (`/var/run -> ../run`). The extraction-time danger
+                        // is only members written THROUGH such a link; the
+                        // resolver below decides that per member. Register
+                        // the raw target at the link's canonical location.
+                        let absolute = t.starts_with('/');
+                        let raw: Vec<String> = t
+                            .split('/')
+                            .filter(|c| !c.is_empty())
+                            .map(String::from)
+                            .collect();
+                        links.insert(at, (raw, absolute));
+                    }
+                }
+                _ => {
+                    // Any member extracted THROUGH a symlink resolves here:
+                    // if following the chain ever leaves the archive root,
+                    // GNU tar would write outside dest.
+                    resolve(&[], &comps, &links, &mut 0).map_err(err)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Feed a real `.tar.gz` through the pure core: iterate members WITHOUT
+    /// unpacking (tar's `entries()` never writes), map entry types to the
+    /// one-char kinds, then delegate to [`Self::validate_members`].
+    pub fn validate_tarball(path: &Path) -> ContainerResult<()> {
+        let file = std::fs::File::open(path).map_err(|e| ContainerError::OperationFailed {
+            container_id: "rootfs".into(),
+            message: format!("open {}: {}", path.display(), e),
+        })?;
+        let gz = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(gz);
+        let mut members: Vec<(char, String, Option<String>)> = Vec::new();
+        for entry in archive
+            .entries()
+            .map_err(|e| ContainerError::OperationFailed {
+                container_id: "rootfs".into(),
+                message: format!("tar iterate: {e}"),
+            })?
+        {
+            let entry = entry.map_err(|e| ContainerError::OperationFailed {
+                container_id: "rootfs".into(),
+                message: format!("tar entry: {e}"),
+            })?;
+            let header = entry.header();
+            let kind = match header.entry_type() {
+                tar::EntryType::Regular | tar::EntryType::Continuous => 'f',
+                tar::EntryType::Symlink => 'l',
+                tar::EntryType::Link => 'h',
+                tar::EntryType::Directory => 'd',
+                _ => 'o',
+            };
+            let name = header
+                .path()
+                .map_err(|e| ContainerError::OperationFailed {
+                    container_id: "rootfs".into(),
+                    message: format!("tar path: {e}"),
+                })?
+                .to_string_lossy()
+                .to_string();
+            let target = match header.link_name() {
+                Ok(Some(t)) => Some(t.to_string_lossy().to_string()),
+                _ => None,
+            };
+            members.push((kind, name, target));
+        }
+        if members.is_empty() {
+            return Err(ContainerError::OperationFailed {
+                container_id: "rootfs".into(),
+                message: "tarball has no members".into(),
+            });
+        }
+        Self::validate_members(&members)
     }
 
     pub async fn copy_rootfs(&self, src: &Path, dest: &Path) -> ContainerResult<()> {
@@ -793,6 +987,198 @@ mod tests {
 #[cfg(test)]
 mod path_validation_tests {
     use super::*;
+
+    // SECURITY (tar-validate, 2026-11-15): the pure decision core.
+    // Semantics after the review-driven rewrite: absolute and `..`
+    // SYMLINK TARGETS ARE LEGITIMATE (real distro images are full of
+    // them — Alpine is 307/339 absolute); what must be rejected is any
+    // member whose extraction would WRITE outside the root (through a
+    // resolving-outside symlink chain), plus absolute/`..` member names
+    // and escaping hardlink targets. Cases run to completion (no
+    // short-circuit) so every shape is actually exercised.
+    #[test]
+    fn validate_members_rejects_hostile_shapes() {
+        type M = (char, String, Option<String>);
+        let bad: Vec<(&str, Vec<M>)> = vec![
+            (
+                "absolute member name",
+                vec![('f', "/etc/passwd".into(), None)],
+            ),
+            (
+                "dotdot in member name",
+                vec![('f', "./../../etc".into(), None)],
+            ),
+            ("dotdot mid-path", vec![('f', "a/../../b".into(), None)]),
+            ("bare dotdot member", vec![('f', "..".into(), None)]),
+            (
+                "write-through escaping relative link",
+                vec![
+                    ('l', "x".into(), Some("../outside".into())),
+                    ('f', "x/passwd".into(), None),
+                ],
+            ),
+            (
+                "write-through escaping absolute link",
+                vec![
+                    ('l', "x".into(), Some("/etc".into())),
+                    ('f', "x/passwd".into(), None),
+                ],
+            ),
+            (
+                "write-through chain of two links",
+                vec![
+                    ('l', "l1".into(), Some("../out1".into())),
+                    ('l', "l2".into(), Some("l1".into())),
+                    ('f', "l2/passwd".into(), None),
+                ],
+            ),
+            (
+                "hardlink target outside the archive",
+                vec![('h', "y".into(), Some("../sibling".into()))],
+            ),
+            ("link without a target", vec![('l', "z".into(), None)]),
+            (
+                "symlink cycle",
+                vec![
+                    ('l', "a".into(), Some("b".into())),
+                    ('l', "b".into(), Some("a".into())),
+                    ('f', "a/f".into(), None),
+                ],
+            ),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (name, case) in &bad {
+            if RootfsManager::validate_members(case).is_ok() {
+                failures.push(format!("{name} was ACCEPTED"));
+            }
+        }
+        assert!(failures.is_empty(), "hostile shapes leaked: {failures:?}");
+    }
+
+    #[test]
+    fn validate_members_accepts_real_rootfs_shapes() {
+        type M = (char, String, Option<String>);
+        // Measured against real distro images (review S1-a): Alpine has
+        // 307/339 absolute symlink targets and 25 containing '..'; Debian
+        // slim 185 absolute. All of these MUST pass.
+        let ok: Vec<M> = vec![
+            ('d', "./".into(), None),
+            ('d', "usr/bin/".into(), None),
+            ('f', "usr/bin/busybox".into(), None),
+            // The canonical dir-merge symlink.
+            ('l', "bin".into(), Some("usr/bin".into())),
+            // Absolute applet links (Alpine's whole model).
+            ('l', "bin/ls".into(), Some("/bin/busybox".into())),
+            // '..' targets that stay net-inside.
+            ('l', "var/run".into(), Some("../run".into())),
+            (
+                'l',
+                "var/spool/cron/crontabs".into(),
+                Some("../../../etc/crontabs".into()),
+            ),
+            // A member written THROUGH a net-inside link is fine.
+            ('f', "var/run/daemon.pid".into(), None),
+            ('f', "etc/os-release".into(), None),
+            // A hardlink to an in-root sibling.
+            ('h', "usr/bin/less".into(), Some("usr/bin/more".into())),
+        ];
+        assert!(RootfsManager::validate_members(&ok).is_ok());
+        assert!(RootfsManager::validate_members(&[]).is_ok());
+    }
+
+    // End-to-end with a REAL crafted archive: a hostile member must be
+    // caught by the pre-scan, and a clean archive must pass it.
+    #[test]
+    fn validate_tarball_scans_real_archives() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let hostile = tmp.path().join("hostile.tar.gz");
+        {
+            let file = std::fs::File::create(&hostile).unwrap();
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut ar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            let data: &[u8] = b"";
+            header.set_path("x").unwrap();
+            header.set_link_name("../outside").unwrap();
+            header.set_cksum();
+            ar.append(&header, data).unwrap();
+            // Isolated link alone is safe; the member under it escapes.
+            let mut fheader = tar::Header::new_gnu();
+            fheader.set_size(0);
+            fheader.set_mode(0o644);
+            fheader.set_path("x/passwd").unwrap();
+            fheader.set_cksum();
+            ar.append(&fheader, data).unwrap();
+            ar.into_inner().unwrap().finish().unwrap();
+        }
+        assert!(RootfsManager::validate_tarball(&hostile).is_err());
+
+        let clean = tmp.path().join("clean.tar.gz");
+        {
+            let file = std::fs::File::create(&clean).unwrap();
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut ar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(b"hello".len() as u64);
+            header.set_mode(0o644);
+            let data: &[u8] = b"hello";
+            header.set_path("usr/bin/hello").unwrap();
+            header.set_cksum();
+            ar.append(&header, data).unwrap();
+            ar.into_inner().unwrap().finish().unwrap();
+        }
+        assert!(RootfsManager::validate_tarball(&clean).is_ok());
+    }
+
+    /// WIRING pin (mutation-killed the day it was written): the pre-scan
+    /// must sit inside `extract_rootfs`, not just exist as a function —
+    /// removing the call lets GNU tar extract the hostile archive below.
+    #[tokio::test]
+    async fn extract_rootfs_refuses_hostile_tarball_before_tar_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hostile = tmp.path().join("wiring.tar.gz");
+        {
+            let file = std::fs::File::create(&hostile).unwrap();
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut ar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_path("escape").unwrap();
+            header.set_link_name("../outside").unwrap();
+            header.set_cksum();
+            ar.append(&header, &b""[..]).unwrap();
+            // Isolated escaping links are safe; the member UNDER it is the
+            // write-through escape this archive must be refused for.
+            let mut fheader = tar::Header::new_gnu();
+            fheader.set_size(0);
+            fheader.set_mode(0o644);
+            fheader.set_path("escape/passwd").unwrap();
+            fheader.set_cksum();
+            ar.append(&fheader, &b""[..]).unwrap();
+            ar.into_inner().unwrap().finish().unwrap();
+        }
+        // NOTE: extract_rootfs short-circuits Ok(()) when dest already
+        // exists (pull_image's "already extracted" path) — so the test must
+        // NOT pre-create it; the function makes its own directory.
+        let dest = tmp.path().join("dest");
+        let mgr = RootfsManager::new(tmp.path());
+        let result = mgr.extract_rootfs(&hostile, &dest).await;
+        assert!(result.is_err(), "pre-scan must refuse the hostile archive");
+        assert!(
+            !dest.join("escape").exists(),
+            "nothing may be extracted from a refused archive"
+        );
+        assert!(
+            !dest.exists(),
+            "refusal happens before mkdir — no empty dest left to fake-cache"
+        );
+    }
 
     /// SECURITY regression (perfsec 2026-11-14): `base_rootfs_path` used to
     /// pass "." and ".." through the charset replace untouched, so

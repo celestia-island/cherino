@@ -13,6 +13,11 @@ publish = true
 
 [dependencies]
 cherino = { path = "../cherino", version = "0.1.0", default-features = false }
+# Read-only archive pre-scan (tar-validate, 2026-11-15): iterate members
+# WITHOUT extracting, so hostile names/links are rejected before GNU tar
+# ever sees them. flate2 ships the pure-Rust miniz_oxide backend by default.
+flate2 = "^1"
+tar = "^0.4"
 async-trait = "^0.1"
 chrono = { version = "^0.4", features = ["serde", "clock"] }
 reqwest = { version = "^0.13", default-features = false, features = [
@@ -24,7 +29,6 @@ reqwest = { version = "^0.13", default-features = false, features = [
 ] }
 serde = { version = "^1", features = ["derive"] }
 serde_json = "^1"
-tar = "^0.4"
 tokio = { version = "^1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "fs", "sync", "signal", "process"] }
 tracing = { version = "^0.1", features = ["log"] }
 uuid = { version = "^1", features = ["v7", "serde"] }

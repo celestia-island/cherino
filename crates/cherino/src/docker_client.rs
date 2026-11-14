@@ -37,19 +37,30 @@ pub(crate) fn docker_host_transport(
         return Ok(None);
     }
     let lower = host.to_ascii_lowercase();
+    // Rebuild the value with a LOWERCASE scheme and the caller's original
+    // remainder: bollard strips the scheme case-sensitively (`replacen("tcp://")`),
+    // so handing it `TCP://…` would classify here and then fail to connect with the
+    // scheme still embedded. The remainder keeps its case — unix socket paths are
+    // case-sensitive.
     for scheme in ["tcp://", "http://"] {
         if lower.starts_with(scheme) {
             if host.len() <= scheme.len() {
                 return Err(unsupported_docker_host(raw));
             }
-            return Ok(Some(DockerHostTransport::Http(host.to_string())));
+            return Ok(Some(DockerHostTransport::Http(format!(
+                "{scheme}{}",
+                &host[scheme.len()..]
+            ))));
         }
     }
     if lower.starts_with("unix://") {
         if host.len() <= "unix://".len() {
             return Err(unsupported_docker_host(raw));
         }
-        return Ok(Some(DockerHostTransport::Unix(host.to_string())));
+        return Ok(Some(DockerHostTransport::Unix(format!(
+            "unix://{}",
+            &host["unix://".len()..]
+        ))));
     }
     Err(unsupported_docker_host(raw))
 }
@@ -122,6 +133,25 @@ mod tests {
                 matches!(classify(value), Ok(Some(DockerHostTransport::Http(_)))),
                 "expected an HTTP transport for {value:?}"
             );
+        }
+    }
+
+    /// The classifier must hand bollard a LOWERCASE scheme: bollard strips the
+    /// scheme case-sensitively, so `TCP://…` would classify and then fail at request
+    /// time. The remainder keeps its original case (socket paths are case-sensitive).
+    #[test]
+    fn the_transport_carries_a_lowercase_scheme() {
+        match classify("TCP://proxy:2375") {
+            Ok(Some(DockerHostTransport::Http(v))) => assert_eq!(v, "tcp://proxy:2375"),
+            other => panic!("expected Http(tcp://proxy:2375), got {other:?}"),
+        }
+        match classify("HTTP://proxy:2375") {
+            Ok(Some(DockerHostTransport::Http(v))) => assert_eq!(v, "http://proxy:2375"),
+            other => panic!("expected Http(http://proxy:2375), got {other:?}"),
+        }
+        match classify("UNIX:///Run/Docker.sock") {
+            Ok(Some(DockerHostTransport::Unix(v))) => assert_eq!(v, "unix:///Run/Docker.sock"),
+            other => panic!("expected Unix with the path case preserved, got {other:?}"),
         }
     }
 

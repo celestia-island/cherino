@@ -493,30 +493,22 @@ impl SeccompProfileData {
     /// mediate that API on kernel 6.1, so admitting it would reopen the
     /// mount-authority bypass this profile exists to close.
     ///
-    /// For accuracy about *why* it fails: libcontainer does make classic
-    /// `mount(2)` calls, and they run first and succeed — the root propagation
-    /// remount (`rootfs/rootfs.rs:52`), the rootfs self-bind
-    /// (`rootfs/rootfs.rs:68-75`), `Mount::make_parent_mount_private`
-    /// (`rootfs/mount.rs:557`), the `/dev` node binds (`rootfs/device.rs:127`)
-    /// and the init-process mounts (`process/init/process.rs:211,523,542,591,707,729`).
-    /// Every mount that comes from the OCI spec then goes through the fd-based
-    /// path and fails with EPERM. So the failure is *after* the classic calls,
-    /// not before them: those calls succeed and are simply not the mounts that
-    /// matter. Consequence, stated
-    /// as a supported limit: **a cosmos container that hosts the inner OCI
-    /// runtime cannot run under this filter** — its first inner mount returns
-    /// EPERM (fail-closed, loudly). Reconciling the two needs either a substrate
-    /// whose LSM mediates the fd-based API or a runtime that uses classic
-    /// `mount(2)`; a `CosmosInnerOci`-style variant is a separate decision with
-    /// its own threat model, not a rider on this one.
-    ///
-    /// What stays denied is the kernel-attack surface no supported caller needs:
-    /// `ptrace`, `bpf`, `kexec_load`/`kexec_file_load`, module load/unload, the
-    /// keyring calls, `perf_event_open`, `userfaultfd`, `process_vm_readv`/
-    /// `writev`, `reboot` and the swap calls. Mount *authority* is not granted:
-    /// `mount(2)`'s `fstype` and target are pointers, so a syscall filter cannot
-    /// scope them; the AppArmor profile `celestia-cherino-fuse` does
-    /// (`mount fstype=fuse.*`, `overlay`, `proc`, `sysfs`, `cgroup`).
+    /// For accuracy about *why* it fails, derived from `libcontainer-0.7.0`
+    /// source rather than from a summary: `RootFS::prepare_rootfs`
+    /// (`rootfs/rootfs.rs:95`) first calls `mount_to_rootfs` (`:34`), which
+    /// performs **three** classic `mount(2)` calls — the `/` propagation remount
+    /// (`:51-61`), `Mount::make_parent_mount_private(rootfs)` (`:65`, itself a
+    /// classic `mount` at `rootfs/mount.rs:557`) and the rootfs self-bind
+    /// (`:68-75`, `MS_BIND|MS_REC`) — and only then iterates the OCI spec's
+    /// mounts through `mounter.setup_mount` (`:87-89`), which is the fd-based
+    /// path. The first spec mount fails with EPERM and `?` aborts
+    /// `prepare_rootfs`, so everything after it never runs: the device binds
+    /// (`rootfs/rootfs.rs:119-121` → `rootfs/device.rs:127`, classic) and the
+    /// init-process mounts (`process/init/process.rs:211,523,542,591,707,729`,
+    /// classic) are unreachable once the filter denies the fd API. Net effect:
+    /// three classic calls succeed, the fd-based call fails, and the runtime
+    /// aborts before touching a device node — more fail-closed than a plain
+    /// "mounts fail" description suggests.
     pub fn cosmos() -> Self {
         let mut profile = Self::entelecheia_default();
         for rule in &mut profile.syscalls {

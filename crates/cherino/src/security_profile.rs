@@ -230,24 +230,37 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
         .find(|opt| security_opt_key(opt) == "seccomp")
         .and_then(|opt| serde_json::from_str::<serde_json::Value>(security_opt_value(opt)).ok())
         .is_some_and(|profile| {
-            let refusing_default = profile["defaultAction"]
-                .as_str()
-                .is_some_and(|action| {
-                    matches!(
-                        action,
-                        "SCMP_ACT_ERRNO"
-                            | "SCMP_ACT_KILL"
-                            | "SCMP_ACT_KILL_THREAD"
-                            | "SCMP_ACT_KILL_PROCESS"
-                            | "SCMP_ACT_TRAP"
-                    )
-                });
+            let refusing_default = profile["defaultAction"].as_str().is_some_and(|action| {
+                matches!(
+                    action,
+                    "SCMP_ACT_ERRNO"
+                        | "SCMP_ACT_KILL"
+                        | "SCMP_ACT_KILL_THREAD"
+                        | "SCMP_ACT_KILL_PROCESS"
+                        | "SCMP_ACT_TRAP"
+                )
+            });
+            // A grant is *any* rule naming `mount` whose action does not refuse:
+            // `SCMP_ACT_ALLOW` obviously, but also `SCMP_ACT_LOG` (allow and log),
+            // `SCMP_ACT_TRACE` and `SCMP_ACT_NOTIFY`. Recognising only ALLOW
+            // certifies "provably denies mount" for a profile that lets the call
+            // through while logging it.
+            let refuses = |action: &str| {
+                matches!(
+                    action,
+                    "SCMP_ACT_ERRNO"
+                        | "SCMP_ACT_KILL"
+                        | "SCMP_ACT_KILL_THREAD"
+                        | "SCMP_ACT_KILL_PROCESS"
+                        | "SCMP_ACT_TRAP"
+                )
+            };
             let allows_mount = profile["syscalls"].as_array().is_some_and(|rules| {
                 rules.iter().any(|rule| {
-                    rule["action"] == "SCMP_ACT_ALLOW"
-                        && rule["names"]
-                            .as_array()
-                            .is_some_and(|names| names.iter().any(|name| name == "mount"))
+                    rule["names"]
+                        .as_array()
+                        .is_some_and(|names| names.iter().any(|name| name == "mount"))
+                        && !refuses(rule["action"].as_str().unwrap_or_default())
                 })
             });
             refusing_default && !allows_mount
@@ -268,7 +281,19 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
 /// `CAP_SYS_ADMIN` is the one that matters; `ALL` is the wildcard form. Anything
 /// else (including the file-ownership caps the compile preset adds) cannot mount.
 pub fn grants_mount_capability(cap_add: Option<&[String]>) -> bool {
-    cap_add.is_some_and(|caps| caps.iter().any(|cap| cap == "SYS_ADMIN" || cap == "ALL"))
+    cap_add.is_some_and(|caps| {
+        caps.iter().any(|cap| {
+            // The runtime normalises capability spellings before it applies them
+            // (case-insensitive, `CAP_` prefix optional) — measured on Docker
+            // 29.6 here: `SYS_ADMIN`, `CAP_SYS_ADMIN`, `sys_admin` and
+            // `Cap_Sys_Admin` all produce the same effective mask. A guard that
+            // exact-matched one spelling would read "cannot mount" for the others
+            // and wave the request through with real SYS_ADMIN granted.
+            let upper = cap.trim().to_ascii_uppercase();
+            let name = upper.strip_prefix("CAP_").unwrap_or(upper.as_str());
+            name == "SYS_ADMIN" || name == "ALL"
+        })
+    })
 }
 
 /// Which DEV-ONLY escape hatches are open in this process.
@@ -975,6 +1000,60 @@ mod tests {
             verify_mount_mediation(&opts).is_ok(),
             "a named AppArmor profile is what scopes mount(2)"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn any_non_refusing_action_naming_mount_is_a_grant() -> Result<()> {
+        // `SCMP_ACT_LOG` allows and logs; recognising only SCMP_ACT_ALLOW would
+        // certify "provably denies mount" for a profile that permits the call.
+        for action in ["SCMP_ACT_LOG", "SCMP_ACT_TRACE", "SCMP_ACT_NOTIFY"] {
+            let profile = format!(
+                r#"{{"defaultAction":"SCMP_ACT_ERRNO","architectures":[],"syscalls":[{{"names":["mount"],"action":"{action}"}}]}}"#
+            );
+            ensure!(
+                verify_mount_mediation(&[format!("seccomp={profile}")]).is_err(),
+                "{action} naming mount must not count as a denial"
+            );
+        }
+        // And the explicit-ALLOW shape from the guard's own threat model.
+        let granted = r#"{"defaultAction":"SCMP_ACT_ERRNO","architectures":[],"syscalls":[{"names":["mount","umount2"],"action":"SCMP_ACT_ALLOW"}]}"#;
+        ensure!(
+            verify_mount_mediation(&[format!("seccomp={granted}")]).is_err(),
+            "a refusing default with an explicit ALLOW rule for mount is a grant"
+        );
+        // A refusing rule for mount is a denial, not a grant.
+        let denied = r#"{"defaultAction":"SCMP_ACT_ERRNO","architectures":[],"syscalls":[{"names":["mount"],"action":"SCMP_ACT_ERRNO"}]}"#;
+        ensure!(
+            verify_mount_mediation(&[format!("seccomp={denied}")]).is_ok(),
+            "an explicit refusal of mount is proof"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capability_spellings_are_normalised() -> Result<()> {
+        // Measured on Docker 29.6: all of these grant the same effective mask, so
+        // the guard must read all of them as "can mount".
+        for spelling in [
+            "SYS_ADMIN",
+            "CAP_SYS_ADMIN",
+            "sys_admin",
+            "Cap_Sys_Admin",
+            "CAP_ALL",
+            "all",
+        ] {
+            ensure!(
+                grants_mount_capability(Some(&[spelling.to_string()])),
+                "{spelling} must be read as mount capability"
+            );
+        }
+        for spelling in ["CHOWN", "CAP_CHOWN", "NET_BIND_SERVICE", "DAC_OVERRIDE"] {
+            ensure!(
+                !grants_mount_capability(Some(&[spelling.to_string()])),
+                "{spelling} must not be read as mount capability"
+            );
+        }
         Ok(())
     }
 

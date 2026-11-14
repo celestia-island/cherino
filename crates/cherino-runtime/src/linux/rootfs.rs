@@ -46,8 +46,26 @@ impl RootfsManager {
         &self.base_dir
     }
 
+    /// SECURITY (perfsec sweep 2026-11-14, fixed 2026-11-15): the charset
+    /// replace below leaves "." and ".." untouched, and
+    /// `PathBuf::join("..")` escapes the cache root — `remove_image` would
+    /// then recursively delete the DATA root. Names failing the same core
+    /// rules as [`Self::validate_path_component`] map to one inert constant
+    /// directory instead (stays total, cannot escape); the reachable
+    /// callers all feed system-generated refs, this is defense in depth.
     pub fn base_rootfs_path(&self, image: &str) -> PathBuf {
-        let safe_name = image.replace(['/', ':', '@'], "_");
+        let safe_name = if image.is_empty()
+            || image == "."
+            || image == ".."
+            || image.contains("..")
+            || image.contains('/')
+            || image.contains('\\')
+            || image.contains('\0')
+        {
+            "_rejected_image_name_".to_string()
+        } else {
+            image.replace(['/', ':', '@'], "_")
+        };
         self.base_dir.join(safe_name)
     }
 
@@ -760,6 +778,40 @@ mod tests {
 #[cfg(test)]
 mod path_validation_tests {
     use super::*;
+
+    /// SECURITY regression (perfsec 2026-11-14): `base_rootfs_path` used to
+    /// pass "." and ".." through the charset replace untouched, so
+    /// `remove_image("..")` joined `base_dir/..` — the DATA root — and
+    /// recursively deleted it. Every image name must stay INSIDE the cache
+    /// root, no matter what it contains.
+    #[test]
+    fn base_rootfs_path_never_escapes_the_cache_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = RootfsManager::new(tmp.path());
+        let root = mgr.cache_dir();
+        for evil in [
+            "..",
+            ".",
+            "",
+            "a..b",
+            "../x",
+            "a/../../b",
+            "\\\\srv\\share",
+            "a\\b",
+        ] {
+            let p = mgr.base_rootfs_path(evil);
+            assert!(
+                p.starts_with(root),
+                "image name {evil:?} must stay under the cache root, got {p:?}"
+            );
+        }
+        // The inert sink must not collide with any real cached image dir.
+        assert_eq!(
+            mgr.base_rootfs_path(".."),
+            root.join("_rejected_image_name_"),
+            "rejected names map to one inert directory"
+        );
+    }
 
     #[test]
     fn validate_rejects_traversal_segments() {

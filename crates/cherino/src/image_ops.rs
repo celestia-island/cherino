@@ -73,6 +73,10 @@ struct SourceForkFacts {
     user: Option<String>,
     /// `Config.Labels` of the source container, merged under the caller's labels.
     labels: HashMap<String, String>,
+    /// False when the source healthcheck carries a `StartInterval`, which
+    /// `HealthcheckParams` cannot express — a tag-path fork would silently change
+    /// the probe cadence, so that case fails closed to a commit.
+    healthcheck_carryable: bool,
     /// Config fields the fork cannot express through `ContainerCreateParams`
     /// (`Cmd`, `Entrypoint`, `ExposedPorts`, `Volumes`, `StopSignal`). A fork is
     /// only equivalent if these already match the image, because tag-path forks
@@ -139,6 +143,48 @@ impl NonRepresentableConfig {
             config.stop_signal.clone(),
         )
     }
+}
+
+/// Everything the fast-path decision needs, captured so the decision itself is a
+/// pure function that can be unit-tested without a daemon.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FastPathInputs<'a> {
+    /// The caller opted in (`ForkOptions::clean_layer`).
+    pub(crate) requested: bool,
+    /// `docker diff` result; `None` means the daemon returned no body (unknown).
+    pub(crate) diff: Option<&'a [FilesystemChange]>,
+    pub(crate) source_mounts: &'a [String],
+    pub(crate) source_tmpfs: &'a [String],
+    pub(crate) read_only_rootfs: Option<bool>,
+    pub(crate) image_id: Option<&'a str>,
+    /// Source container config equals the image's where a tag cannot carry it.
+    pub(crate) configs_match: bool,
+    /// The source healthcheck has no `start_interval`, which `HealthcheckParams`
+    /// cannot express (so a tag-path fork would silently change the probe cadence).
+    pub(crate) healthcheck_carryable: bool,
+}
+
+/// The single place that decides whether the clean-layer fast path may run.
+///
+/// Every gate is conjunctive and every "unknown" answer is a no: an unrequested
+/// path, an unreadable diff, a writable or unknown rootfs, an unresolved image, a
+/// config the tag cannot carry, or a healthcheck it cannot carry all fall back to
+/// the ordinary commit.
+pub(crate) fn fast_path_allowed(inputs: &FastPathInputs<'_>) -> bool {
+    inputs.requested
+        && inputs.configs_match
+        && inputs.healthcheck_carryable
+        && inputs.read_only_rootfs == Some(true)
+        && inputs.image_id.is_some_and(|id| !id.trim().is_empty())
+        && inputs.diff.is_some_and(|changes| {
+            fork_can_reuse_source_image(
+                changes,
+                inputs.source_mounts,
+                inputs.source_tmpfs,
+                inputs.read_only_rootfs,
+                inputs.image_id,
+            )
+        })
 }
 
 /// True when a fork may start from the source container's own image instead of
@@ -324,6 +370,10 @@ impl ContainerManager {
             .and_then(|c| c.user.clone())
             .filter(|u| !u.trim().is_empty());
         let labels = config.and_then(|c| c.labels.clone()).unwrap_or_default();
+        let healthcheck_carryable = config
+            .and_then(|c| c.healthcheck.as_ref())
+            .and_then(|hc| hc.start_interval)
+            .is_none();
         let non_representable = NonRepresentableConfig::from_config(config);
 
         Ok(SourceForkFacts {
@@ -336,6 +386,7 @@ impl ContainerManager {
             env,
             user,
             labels,
+            healthcheck_carryable,
             non_representable,
         })
     }
@@ -365,9 +416,12 @@ impl ContainerManager {
         };
         // Fail closed: an unreadable diff is "unknown", never "clean".
         // Cheap preconditions first: an opt-in caller with a writable source (or an
-        // unresolvable image) must not pay a full recursive layer diff only to
-        // commit anyway.
-        if facts.read_only_rootfs != Some(true) || facts.image_id.trim().is_empty() {
+        // unresolvable image, or a config a tag cannot carry) must not pay a full
+        // recursive layer diff only to commit anyway.
+        if facts.read_only_rootfs != Some(true)
+            || facts.image_id.trim().is_empty()
+            || !facts.healthcheck_carryable
+        {
             return None;
         }
         // A tag-path fork inherits Cmd/Entrypoint/ExposedPorts/Volumes/StopSignal from
@@ -415,13 +469,16 @@ impl ContainerManager {
                 return None;
             }
         };
-        if !fork_can_reuse_source_image(
-            &changes,
-            &facts.mount_destinations,
-            &facts.tmpfs_roots,
-            facts.read_only_rootfs,
-            Some(facts.image_id.as_str()),
-        ) {
+        if !fast_path_allowed(&FastPathInputs {
+            requested: true,
+            diff: Some(&changes),
+            source_mounts: &facts.mount_destinations,
+            source_tmpfs: &facts.tmpfs_roots,
+            read_only_rootfs: facts.read_only_rootfs,
+            image_id: Some(facts.image_id.as_str()),
+            configs_match: true,
+            healthcheck_carryable: facts.healthcheck_carryable,
+        }) {
             return None;
         }
 
@@ -1079,6 +1136,147 @@ mod tests {
             build(None, Some(vec!["/b".to_string(), "/a".to_string()])),
             build(None, Some(vec!["/a".to_string(), "/b".to_string()]))
         );
+    }
+
+    /// Every gate of the decision, one at a time, without a daemon. The previous
+    /// rounds showed these arms were only reachable through the docker-gated test,
+    /// so inverting any of them stayed green.
+    #[test]
+    fn fast_path_decision_pins_all_gates() {
+        let clean = [change("/celestia/entelecheia")];
+        let mounts = dests(&["/celestia/entelecheia"]);
+        let tmpfs = no_tmpfs();
+        let base = FastPathInputs {
+            requested: true,
+            diff: Some(&clean),
+            source_mounts: &mounts,
+            source_tmpfs: &tmpfs,
+            read_only_rootfs: Some(true),
+            image_id: Some("sha256:c49ba4b956a5"),
+            configs_match: true,
+            healthcheck_carryable: true,
+        };
+        assert!(
+            fast_path_allowed(&base),
+            "the all-green shape must be allowed"
+        );
+
+        let inversions: [(&str, FastPathInputs<'_>); 7] = [
+            (
+                "not requested",
+                FastPathInputs {
+                    requested: false,
+                    ..base
+                },
+            ),
+            (
+                "daemon reported no diff (unknown)",
+                FastPathInputs { diff: None, ..base },
+            ),
+            (
+                "writable rootfs",
+                FastPathInputs {
+                    read_only_rootfs: Some(false),
+                    ..base
+                },
+            ),
+            (
+                "unknown rootfs",
+                FastPathInputs {
+                    read_only_rootfs: None,
+                    ..base
+                },
+            ),
+            (
+                "unresolved image",
+                FastPathInputs {
+                    image_id: None,
+                    ..base
+                },
+            ),
+            (
+                "configs differ where a tag cannot carry them",
+                FastPathInputs {
+                    configs_match: false,
+                    ..base
+                },
+            ),
+            (
+                "healthcheck not carryable",
+                FastPathInputs {
+                    healthcheck_carryable: false,
+                    ..base
+                },
+            ),
+        ];
+        for (label, inputs) in inversions {
+            assert!(!fast_path_allowed(&inputs), "must fall back on: {label}");
+        }
+
+        // A real write in the diff still forces a commit through the same path.
+        let dirty = [change("/home/entelecheia/x")];
+        assert!(!fast_path_allowed(&FastPathInputs {
+            diff: Some(&dirty),
+            ..base
+        }));
+    }
+
+    /// The carried config must reproduce the commit path: params win, source fills
+    /// the gaps, and an env value containing '=' survives intact.
+    #[test]
+    fn merged_env_and_labels_prefer_the_caller() {
+        let facts = SourceForkFacts {
+            image_id: "sha256:aa".to_string(),
+            read_only_rootfs: Some(true),
+            mount_destinations: Vec::new(),
+            tmpfs_roots: Vec::new(),
+            working_dir: None,
+            healthcheck: None,
+            env: vec![
+                "A=1".to_string(),
+                "B=from-source".to_string(),
+                "EQ=a=b=c".to_string(),
+                "EMPTY=".to_string(),
+            ],
+            user: Some("1000:1000".to_string()),
+            labels: [("k".to_string(), "shared".to_string())]
+                .into_iter()
+                .collect(),
+            healthcheck_carryable: true,
+            non_representable: NonRepresentableConfig::default(),
+        };
+        let mut params = ContainerForkParams {
+            source_container_id: "src".to_string(),
+            new_name: "fork".to_string(),
+            network: None,
+            volumes: Vec::new(),
+            env: HashMap::new(),
+            labels: HashMap::new(),
+            commit_labels: None,
+            image_tag: None,
+            user: None,
+            memory_limit: None,
+            nano_cpus: None,
+            pids_limit: None,
+            cap_drop: None,
+            cap_add: None,
+            security_opt: None,
+            read_only_rootfs: None,
+        };
+        params
+            .env
+            .insert("B".to_string(), "from-params".to_string());
+        params
+            .labels
+            .insert("k".to_string(), "override".to_string());
+
+        let env = facts.merged_env(&params);
+        assert_eq!(env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(env.get("B").map(String::as_str), Some("from-params"));
+        assert_eq!(env.get("EQ").map(String::as_str), Some("a=b=c"));
+        assert_eq!(env.get("EMPTY").map(String::as_str), Some(""));
+        let labels = facts.merged_labels(&params);
+        assert_eq!(labels.get("k").map(String::as_str), Some("override"));
     }
 
     #[test]

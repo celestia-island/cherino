@@ -249,6 +249,7 @@ impl ContainerManager {
         match security_profile::decide_security_request(
             &security_opt,
             security_profile::DevHatches::from_env(),
+            security_profile::grants_mount_capability(params.cap_add.as_deref()),
         ) {
             security_profile::RequestDecision::Proceed { hatch: None } => {}
             security_profile::RequestDecision::Proceed { hatch: Some(hatch) } => {

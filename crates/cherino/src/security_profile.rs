@@ -234,6 +234,14 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
     )
 }
 
+/// Whether a capability set makes `mount(2)` reachable at all.
+///
+/// `CAP_SYS_ADMIN` is the one that matters; `ALL` is the wildcard form. Anything
+/// else (including the file-ownership caps the compile preset adds) cannot mount.
+pub fn grants_mount_capability(cap_add: Option<&[String]>) -> bool {
+    cap_add.is_some_and(|caps| caps.iter().any(|cap| cap == "SYS_ADMIN" || cap == "ALL"))
+}
+
 /// Which DEV-ONLY escape hatches are open in this process.
 ///
 /// Passed in rather than read from the environment so the decision below stays
@@ -279,12 +287,25 @@ pub enum RequestDecision {
 
 /// The pre-create half of the security self-check.
 ///
-/// A request whose `mount` is unproven is refused — unless a DEV-ONLY hatch is
-/// deliberately open, in which case it proceeds with the hatch named so the
-/// caller can make the downgrade loud. The hatches exist to unblock local work;
-/// silently bricking them would be worse than a warning, because the next person
-/// would remove the guard instead of the hatch.
-pub fn decide_security_request(requested: &[String], hatches: DevHatches) -> RequestDecision {
+/// `grants_mount_capability` says whether the container will hold
+/// `CAP_SYS_ADMIN` (or `ALL`): without it, `mount(2)` cannot succeed whatever the
+/// filter allows, so there is nothing to scope and the request proceeds — a
+/// `postgres()`-style list (only `no-new-privileges`) must not be refused just
+/// because it names neither AppArmor nor a seccomp profile.
+///
+/// With the capability granted, a request whose `mount` is unproven is refused —
+/// unless a DEV-ONLY hatch is deliberately open, in which case it proceeds with
+/// the hatch named so the caller can make the downgrade loud. The hatches exist
+/// to unblock local work; silently bricking them would be worse than a warning,
+/// because the next person would remove the guard instead of the hatch.
+pub fn decide_security_request(
+    requested: &[String],
+    hatches: DevHatches,
+    grants_mount_capability: bool,
+) -> RequestDecision {
+    if !grants_mount_capability {
+        return RequestDecision::Proceed { hatch: None };
+    }
     match verify_mount_mediation(requested) {
         Ok(()) => RequestDecision::Proceed { hatch: None },
         Err(reason) => match hatches.any() {
@@ -931,7 +952,7 @@ mod tests {
     #[test]
     fn decide_security_request_proceeds_on_the_cosmos_pair() -> Result<()> {
         ensure!(
-            decide_security_request(&cosmos_security_opts(), DevHatches::default())
+            decide_security_request(&cosmos_security_opts(), DevHatches::default(), true)
                 == RequestDecision::Proceed { hatch: None },
             "the shipped pair must proceed without a hatch"
         );
@@ -944,11 +965,45 @@ mod tests {
         opts.push("apparmor=unconfined".to_string());
         ensure!(
             matches!(
-                decide_security_request(&opts, DevHatches::default()),
+                decide_security_request(&opts, DevHatches::default(), true),
                 RequestDecision::Refuse(_)
             ),
             "an unproven list must be refused without a hatch"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_container_without_sys_admin_needs_no_mount_mediation() -> Result<()> {
+        // The `postgres()` preset: only `no-new-privileges`, no SYS_ADMIN, no
+        // seccomp, no AppArmor. It cannot mount, so nothing needs scoping —
+        // demanding mediation here would fail every such create.
+        let mut params_caps: Option<Vec<String>> = None;
+        ensure!(
+            !grants_mount_capability(params_caps.as_deref()),
+            "no cap_add means no mount capability"
+        );
+        let postgres_opts = vec!["no-new-privileges:true".to_string()];
+        ensure!(
+            decide_security_request(&postgres_opts, DevHatches::default(), false)
+                == RequestDecision::Proceed { hatch: None },
+            "a non-mounting container must proceed"
+        );
+        // With SYS_ADMIN the same list is a real hole and must be refused.
+        ensure!(
+            matches!(
+                decide_security_request(&postgres_opts, DevHatches::default(), true),
+                RequestDecision::Refuse(_)
+            ),
+            "the same list with SYS_ADMIN must be refused"
+        );
+        params_caps = Some(vec!["CHOWN".to_string(), "SETGID".to_string()]);
+        ensure!(
+            !grants_mount_capability(params_caps.as_deref()),
+            "file-ownership caps are not mount capability"
+        );
+        ensure!(grants_mount_capability(Some(&["SYS_ADMIN".to_string()])));
+        ensure!(grants_mount_capability(Some(&["ALL".to_string()])));
         Ok(())
     }
 
@@ -975,7 +1030,7 @@ mod tests {
             ),
         ] {
             ensure!(
-                decide_security_request(&unpaired, hatches)
+                decide_security_request(&unpaired, hatches, true)
                     == RequestDecision::Proceed {
                         hatch: Some(expected)
                     },

@@ -469,6 +469,7 @@ impl ContainerOps for CliContainerBackend {
             match crate::security_profile::decide_security_request(
                 requested,
                 crate::security_profile::DevHatches::from_env(),
+                crate::security_profile::grants_mount_capability(params.cap_add.as_deref()),
             ) {
                 crate::security_profile::RequestDecision::Proceed { hatch: None } => {}
                 crate::security_profile::RequestDecision::Proceed { hatch: Some(hatch) } => {

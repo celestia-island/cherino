@@ -501,6 +501,9 @@ async fn create_refuses_a_mispaired_security_list_without_starting_a_container()
 
     let mut params = cherino::types::ContainerCreateParams::simple(name.clone(), image);
     params.network = Some("bridge".to_string());
+    // The capability that makes mount reachable in the first place: without it
+    // the guard rightly lets the list through (see the postgres-shaped test).
+    params.cap_add = Some(vec!["SYS_ADMIN".to_string()]);
     // seccomp admits mount, AppArmor is unconfined: nothing scopes the target.
     params.security_opt = Some({
         let mut opts = vec![
@@ -534,4 +537,33 @@ async fn create_refuses_a_mispaired_security_list_without_starting_a_container()
         listed.is_empty(),
         "create must not leave a container behind: {listed:?}"
     );
+}
+
+/// A container that cannot mount needs no mount mediation: a `postgres()`-style
+/// list (only `no-new-privileges`, no `SYS_ADMIN`) must still be created. This is
+/// the regression guard for over-reaching the pair check into every preset.
+#[tokio::test]
+#[ignore = "requires docker + CHERINO_SECCOMP_TEST_IMAGE"]
+async fn create_accepts_a_list_that_does_not_grant_mount() {
+    use cherino::security_profile;
+
+    let Some(image) = image() else {
+        panic!("set CHERINO_SECCOMP_TEST_IMAGE");
+    };
+    let manager = cherino::ContainerManager::new().expect("docker connection");
+    let name = format!("cherino-r2-nomount-{}", std::process::id());
+
+    let preset = security_profile::postgres();
+    let mut params = cherino::types::ContainerCreateParams::simple(name, image);
+    params.network = Some("bridge".to_string());
+    params.cap_drop = preset.cap_drop.clone();
+    params.cap_add = preset.cap_add.clone();
+    params.security_opt = preset.security_opt.clone();
+    params.egress_policy = None;
+
+    let info = manager
+        .create(&params)
+        .await
+        .expect("a non-mounting container must not be refused");
+    manager.remove(&info.id, true).await.expect("cleanup");
 }

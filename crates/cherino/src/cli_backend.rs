@@ -460,11 +460,15 @@ impl ContainerOps for CliContainerBackend {
     // -- Lifecycle --
 
     async fn create(&self, params: &ContainerCreateParams) -> ContainerResult<ContainerInfo> {
-        // Same request-shape guard as the Docker backend: a `security_opt` whose
-        // mount mediation is unproven must never reach a runtime. This backend
-        // has no post-start inspect/drift check (the CLI output is not a reliable
-        // echo of the applied profile), so the pre-create half is the whole
-        // check here — and it is the half that matters for this class of bug.
+        // The request-shape guard, for a `security_opt` that is present: a list
+        // whose mount mediation is unproven must never reach a runtime. Two
+        // caveats this backend does NOT share with the Docker path, stated rather
+        // than implied — (1) `security_opt: None` skips this block entirely
+        // (the Docker backend substitutes a default profile first, so it always
+        // has a list to check), and (2) there is no post-start inspect/drift
+        // check here because CLI output is not a reliable echo of the applied
+        // profile. So the guard below covers `Some(..)` only, and the post-start
+        // half is absent by design, not by omission.
         if let Some(requested) = params.security_opt.as_deref() {
             match crate::security_profile::decide_security_request(
                 requested,

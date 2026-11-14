@@ -6,7 +6,7 @@ use super::{
     errors::{ContainerError, ContainerResult},
     types::{
         ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo,
-        ContainerVersion, ExecOutput, ImageInfo, PathChange, WritableRootfs,
+        ContainerVersion, ExecOutput, ForkOptions, ImageInfo, PathChange, WritableRootfs,
     },
 };
 
@@ -39,6 +39,28 @@ pub trait ContainerOps: Send + Sync {
     // -- Fork / Commit --
 
     async fn fork(&self, params: &ContainerForkParams) -> ContainerResult<ContainerInfo>;
+
+    /// Fork with explicit opt-in switches.
+    ///
+    /// The default implementation refuses `clean_layer` loudly and otherwise
+    /// delegates to [`Self::fork`], so a backend that cannot honour the switch
+    /// never silently ignores it. Backends with a native fast path override this.
+    async fn fork_with_options(
+        &self,
+        params: &ContainerForkParams,
+        options: ForkOptions,
+    ) -> ContainerResult<ContainerInfo> {
+        if options.clean_layer {
+            // `UnsupportedBackend` rather than a generic operation failure: the
+            // caller asked for a capability this backend does not have, and a
+            // consumer branching on the taxonomy must be able to tell that apart
+            // from a fork that failed while doing real work.
+            return Err(ContainerError::UnsupportedBackend(
+                "fork_with_options:clean_layer".to_string(),
+            ));
+        }
+        self.fork(params).await
+    }
     async fn commit(
         &self,
         container_id: &str,
@@ -292,6 +314,56 @@ mod tests {
     /// product name, and `Ok(None)` is how it says so — never a
     /// placeholder version, never an error a consumer would log as a probe
     /// failure.
+    fn null_fork_params() -> ContainerForkParams {
+        ContainerForkParams {
+            source_container_id: "src".to_string(),
+            new_name: "fork".to_string(),
+            network: None,
+            volumes: Vec::new(),
+            env: HashMap::new(),
+            labels: HashMap::new(),
+            commit_labels: None,
+            image_tag: None,
+            user: None,
+            memory_limit: None,
+            nano_cpus: None,
+            pids_limit: None,
+            cap_drop: None,
+            cap_add: None,
+            security_opt: None,
+            read_only_rootfs: None,
+        }
+    }
+
+    /// A backend that does not implement the clean-layer path must REFUSE the
+    /// switch, never silently take the commit path: `clean_layer: true` is an
+    /// explicit request, and a backend that cannot honour it has to say so.
+    #[tokio::test]
+    async fn fork_with_options_default_refuses_clean_layer() {
+        let err = NullBackend
+            .fork_with_options(&null_fork_params(), ForkOptions { clean_layer: true })
+            .await
+            .expect_err("a non-supporting backend must not accept clean_layer");
+        assert!(
+            matches!(&err, ContainerError::UnsupportedBackend(m) if m.contains("clean_layer")),
+            "the refusal must surface as UnsupportedBackend naming the switch: {err:?}"
+        );
+    }
+
+    /// With the switch off, the default body must delegate to `fork` — i.e. a
+    /// backend that never opted in keeps its ordinary behaviour, not a new error.
+    #[tokio::test]
+    async fn fork_with_options_default_delegates_to_fork() {
+        let err = NullBackend
+            .fork_with_options(&null_fork_params(), ForkOptions::default())
+            .await
+            .expect_err("NullBackend::fork is UnsupportedBackend");
+        assert!(
+            matches!(&err, ContainerError::UnsupportedBackend(m) if m == "fork"),
+            "default options must reach the backend's own fork: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn version_defaults_to_none() {
         let version = NullBackend

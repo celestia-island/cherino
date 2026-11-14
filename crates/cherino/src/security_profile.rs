@@ -130,6 +130,10 @@ fn merge_security_opts(primary: Vec<String>, secondary: Vec<String>) -> Vec<Stri
     merged
 }
 
+/// `security_opt` keys the runtime merges instead of replacing, so repeating
+/// them is well-defined and must not be treated as ambiguity.
+pub const ADDITIVE_SECURITY_OPT_KEYS: [&str; 1] = ["label"];
+
 /// The key of one Docker `security_opt` entry: the text before the first `=` or
 /// `:` (`seccomp={...}`, `apparmor=…`, `no-new-privileges:true`).
 pub fn security_opt_key(opt: &str) -> &str {
@@ -194,9 +198,15 @@ impl SecurityOptDrift {
 /// assumed. Lists whose seccomp profile denies `mount` (the default and
 /// `compile` presets) are fine on their own.
 pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
-    // Duplicated keys make the list ambiguous: which entry a runtime applies is
-    // not defined, so nothing about it is provable.
+    // Duplicated keys make a list ambiguous — which entry a runtime applies is
+    // not defined — so nothing about it is provable. Only keys whose entries
+    // *replace* one another are affected: `label=` is additive (the runtime
+    // merges every occurrence), so duplicates there are legitimate and are not
+    // this guard's business.
     for key in requested.iter().map(|opt| security_opt_key(opt)) {
+        if ADDITIVE_SECURITY_OPT_KEYS.contains(&key) {
+            continue;
+        }
         if requested
             .iter()
             .filter(|opt| security_opt_key(opt) == key)
@@ -204,7 +214,7 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
             > 1
         {
             return Err(format!(
-                "`{key}` appears more than once in security_opt; which entry the runtime                  applies is undefined, so the boundary is unprovable"
+                "`{key}` appears more than once in security_opt; which entry the runtime applies is undefined, so the boundary is unprovable"
             ));
         }
     }
@@ -220,9 +230,10 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
     }
     // Fail closed: without AppArmor, the only acceptable list is one whose
     // seccomp profile **provably denies** `mount`. "Provably" means a refusing
-    // default action *and* no `SCMP_ACT_ALLOW` rule naming `mount` — a profile
-    // with `defaultAction: SCMP_ACT_ALLOW` and no rules denies nothing, so it
-    // must not be read as proof. Anything we cannot parse — `seccomp=unconfined`,
+    // default action *and* no rule naming `mount` whose own action does not
+    // refuse — `ALLOW`, `LOG`, `TRACE` and `NOTIFY` all let the call through,
+    // and a profile with `defaultAction: SCMP_ACT_ALLOW` and no rules denies
+    // nothing at all, so none of them may be read as proof. Anything we cannot parse — `seccomp=unconfined`,
     // a profile path, no seccomp entry at all — is unproven, and unproven means
     // refused.
     let denies_mount = requested

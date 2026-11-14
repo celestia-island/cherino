@@ -36,11 +36,25 @@ impl ContainerManager {
         &self,
         container_id: &str,
     ) -> ContainerResult<Vec<FilesystemChange>> {
+        self.container_filesystem_changes_checked(container_id)
+            .await
+            .map(Option::unwrap_or_default)
+    }
+
+    /// The diff WITHOUT collapsing the daemon's "no answer" into an empty list.
+    ///
+    /// `None` means the daemon returned no diff body — for a state-safety
+    /// decision that is "unknown", not "clean", and callers must treat it as a
+    /// failure. `container_filesystem_changes` keeps the lenient shape for
+    /// merge/back-copy callers that only care about the paths they can see.
+    pub async fn container_filesystem_changes_checked(
+        &self,
+        container_id: &str,
+    ) -> ContainerResult<Option<Vec<FilesystemChange>>> {
         self.docker
             .container_changes(container_id)
             .await
             .map_err(ContainerError::from)
-            .map(|opt| opt.unwrap_or_default())
     }
 
     pub async fn upload_archive(

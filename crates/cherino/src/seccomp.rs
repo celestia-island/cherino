@@ -496,7 +496,8 @@ impl SeccompProfileData {
     /// For accuracy about *why* it fails, derived from `libcontainer-0.7.0`
     /// source rather than from a summary: `RootFS::prepare_rootfs`
     /// (`rootfs/rootfs.rs:95`) first calls `mount_to_rootfs` (`:34`), which
-    /// performs **three** classic `mount(2)` calls — the `/` propagation remount
+    /// performs three classic `mount(2)` calls before the spec loop — the `/`
+    /// propagation remount
     /// (`:51-61`), `Mount::make_parent_mount_private(rootfs)` (`:65`, itself a
     /// classic `mount` at `rootfs/mount.rs:557`) and the rootfs self-bind
     /// (`:68-75`, `MS_BIND|MS_REC`) — and only then iterates the OCI spec's
@@ -695,11 +696,12 @@ mod tests {
 
     #[test]
     fn unshare_not_allow_or_deny_listed() -> Result<()> {
-        // For a plain workload `unshare` is an escape vector: it must appear in
-        // NEITHER the allow-list NOR the explicit deny-list, relying on the
-        // deny-by-default action (SCMP_ACT_ERRNO) to block it. The cosmos preset
-        // is the documented exception (it hosts namespace-creating code) and is
-        // asserted separately below.
+        // `unshare` is an escape vector: it appears in NEITHER the allow-list NOR
+        // the explicit deny-list, relying on the deny-by-default action
+        // (SCMP_ACT_ERRNO) to block it. This holds for all three presets now —
+        // the cosmos preset briefly allowed the namespace family while it was
+        // scoped to the inner OCI runtime, and that half was retracted (see
+        // `SeccompProfileData::cosmos`).
         for profile in [
             SeccompProfile::EntelecheiaDefault.to_profile_data(),
             SeccompProfile::Compile.to_profile_data(),

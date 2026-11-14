@@ -46,8 +46,41 @@ impl RootfsManager {
         &self.base_dir
     }
 
+    /// SECURITY (perfsec sweep 2026-11-14, fixed 2026-11-15): the charset
+    /// replace below leaves "." and ".." untouched, and
+    /// `PathBuf::join("..")` escapes the cache root — `remove_image` would
+    /// then recursively delete the DATA root. Names failing the same core
+    /// rules as [`Self::validate_path_component`] map to one inert constant
+    /// directory instead (stays total, cannot escape); the reachable
+    /// callers all feed system-generated refs, this is defense in depth.
     pub fn base_rootfs_path(&self, image: &str) -> PathBuf {
-        let safe_name = image.replace(['/', ':', '@'], "_");
+        let safe_name = if image.is_empty()
+            || image == "."
+            || image == ".."
+            || image.contains("..")
+            || image.contains('/')
+            || image.contains('\\')
+            || image.contains('\0')
+        {
+            // Injective per-input sink (review S2, 2026-11-15): one shared
+            // constant made every rejected name collide — a first rejected
+            // pull would short-circuit `is_dir()` for all the others and a
+            // interrupted unpack would block them forever. Hex-encoding the
+            // raw name gives each evil input its own directory and can never
+            // equal a legit `replace` output of a *different* image (the
+            // only fixed point would be an image literally named like
+            // another image's full hex encoding — absurd, and still
+            // cache-level even then).
+            format!(
+                "_rejected_{}",
+                image
+                    .bytes()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        } else {
+            image.replace(['/', ':', '@'], "_")
+        };
         self.base_dir.join(safe_name)
     }
 
@@ -760,6 +793,52 @@ mod tests {
 #[cfg(test)]
 mod path_validation_tests {
     use super::*;
+
+    /// SECURITY regression (perfsec 2026-11-14): `base_rootfs_path` used to
+    /// pass "." and ".." through the charset replace untouched, so
+    /// `remove_image("..")` joined `base_dir/..` — the DATA root — and
+    /// recursively deleted it. Every image name must stay INSIDE the cache
+    /// root, no matter what it contains.
+    #[test]
+    fn base_rootfs_path_never_escapes_the_cache_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = RootfsManager::new(tmp.path());
+        let root = mgr.cache_dir();
+        for evil in [
+            "..",
+            ".",
+            "",
+            "a..b",
+            "../x",
+            "a/../../b",
+            "\\\\srv\\share",
+            "a\\b",
+        ] {
+            let p = mgr.base_rootfs_path(evil);
+            assert!(
+                p.starts_with(root),
+                "image name {evil:?} must stay under the cache root, got {p:?}"
+            );
+        }
+        // Review S2 pin: distinct rejected names get DISTINCT sink dirs
+        // (one shared constant let a first rejected pull short-circuit
+        // every other), and no rejected name shares a directory with a
+        // legit mapping.
+        let a = mgr.base_rootfs_path("..");
+        let b = mgr.base_rootfs_path("../x");
+        assert_ne!(a, b, "distinct evil names must not collide");
+        assert!(
+            !a.to_string_lossy().ends_with("_rejected_image_name_"),
+            "no shared-constant sink"
+        );
+        // S3c pin: the pre-fix code mapped "" to the cache root ITSELF —
+        // remove_image("") deleted the whole cache root. Never again.
+        assert_ne!(
+            mgr.base_rootfs_path(""),
+            root,
+            "empty name must not resolve to the cache root itself"
+        );
+    }
 
     #[test]
     fn validate_rejects_traversal_segments() {

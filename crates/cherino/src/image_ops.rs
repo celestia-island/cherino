@@ -12,41 +12,54 @@ use tracing::{info, warn};
 use super::{
     errors::{ContainerError, ContainerResult},
     manager::ContainerManager,
-    types::{ContainerForkParams, ContainerInfo, ForkOptions, ImageInfo, VolumeMount},
+    types::{ContainerForkParams, ContainerInfo, ForkOptions, ImageInfo},
 };
 
 const COSMOS_FORK_PREFIX: &str = "cosmos-fork-";
 const COSMOS_SNAPSHOT_PREFIX: &str = "cosmos-snapshot-";
 
-/// Directories a runtime may back with tmpfs; reuses the sandbox preset's list so
-/// there is one source of truth. Their *contents* never enter the writable layer,
-/// so a change record naming the mount root is scaffolding. A record *below* one
-/// is deliberately not scaffolding: seeing it proves the path is a real
-/// directory, i.e. the container has genuine state there.
-const RUNTIME_SCRATCH_ROOTS: [&str; 3] = super::security_profile::READONLY_SCRATCH_PATHS;
+/// Fallback when the source container reports no tmpfs at all: the sandbox
+/// preset's list (`security_profile::READONLY_SCRATCH_PATHS`), which
+/// `apply_readonly_scratch` installs on every read-only rootfs. Contents of a
+/// tmpfs mount never enter the writable layer, so a change record naming the
+/// mount root itself is scaffolding. A record *below* one is deliberately not
+/// scaffolding: seeing it proves the path is a real directory, i.e. the
+/// container has genuine state there.
+const FALLBACK_TMPFS_ROOTS: [&str; 3] = super::security_profile::READONLY_SCRATCH_PATHS;
 
 /// What the fast path needs to know about the source container.
 struct SourceForkFacts {
     image_id: String,
+    /// The source's own `HostConfig.ReadonlyRootfs`, not the fork's requested one.
     read_only_rootfs: Option<bool>,
+    /// Destinations the source really mounts (bind/volume/tmpfs). This — not the
+    /// fork's `params.volumes` — is the scaffolding oracle: a diff describes the
+    /// source's layer, so only paths the *source* masked are content-free.
+    mount_destinations: Vec<String>,
+    /// tmpfs roots reported by the source (fallback: `FALLBACK_TMPFS_ROOTS`).
+    tmpfs_roots: Vec<String>,
 }
 
 /// True when a fork may start from the source container's own image instead of
 /// committing a new one. All three preconditions must hold:
 ///
-/// 1. the source rootfs is read-only, so no write can have reached the layer;
-/// 2. every recorded change is runtime scaffolding — a bind-mount destination
-///    from `volumes`, a tmpfs mount root, or an ancestor directory of a bind
-///    destination (tmpfs roots are top-level, so they have no such ancestor);
+/// 1. the source rootfs is read-only **and** its diff proves the layer is clean
+///    (the flag alone is not proof: the sandbox profile grants `SYS_ADMIN`, so a
+///    `mount -o remount,rw /` inside the container is possible and would leave
+///    the flag set while content reached the layer — the diff catches that);
+/// 2. every recorded change is runtime scaffolding — a destination the *source*
+///    mounts, a tmpfs root the source has, or an ancestor directory of a source
+///    mount destination (tmpfs roots are top-level, so they have no ancestor);
 /// 3. the source image id resolved, so there is an image to fork from.
 ///
-/// Anything else (a real write, a writable rootfs, an unresolved image) returns
-/// `false` and the caller takes the ordinary commit path. The response is a
-/// normal `docker tag` of the source image under the fork tag, so
+/// Anything else (a real write, a writable or unknown rootfs, an unresolved
+/// image) returns `false` and the caller takes the ordinary commit path. The
+/// response is a normal `docker tag` of the source image under the fork tag, so
 /// [`ContainerManager::remove_with_image`] still finds a `cosmos-fork-*` ref.
 pub fn fork_can_reuse_source_image(
     changes: &[FilesystemChange],
-    volumes: &[VolumeMount],
+    source_mount_destinations: &[String],
+    source_tmpfs_roots: &[String],
     source_read_only_rootfs: Option<bool>,
     source_image_id: Option<&str>,
 ) -> bool {
@@ -59,25 +72,36 @@ pub fn fork_can_reuse_source_image(
     if image_id.trim().is_empty() {
         return false;
     }
+    let fallback_tmpfs: Vec<String> = FALLBACK_TMPFS_ROOTS.iter().map(|s| s.to_string()).collect();
+    let tmpfs: &[String] = if source_tmpfs_roots.is_empty() {
+        &fallback_tmpfs
+    } else {
+        source_tmpfs_roots
+    };
     changes.iter().all(|c| {
         // A delete means real content left the layer, so it is never scaffolding
         // even at a mount path (which a live mount makes undeletable anyway).
-        !matches!(c.kind, bollard::models::ChangeType::_2) && is_runtime_scaffold(&c.path, volumes)
+        !matches!(c.kind, bollard::models::ChangeType::_2)
+            && is_runtime_scaffold(&c.path, source_mount_destinations, tmpfs)
     })
 }
 
-/// A diff path that cannot carry container state: an exact tmpfs root, an exact
-/// bind destination, or a strict ancestor directory of either.
-fn is_runtime_scaffold(path: &str, volumes: &[VolumeMount]) -> bool {
+/// A diff path that cannot carry container state: an exact tmpfs root of the
+/// source, an exact source mount destination, or a strict ancestor directory of
+/// a source mount destination.
+fn is_runtime_scaffold(path: &str, mount_destinations: &[String], tmpfs_roots: &[String]) -> bool {
     let path = path.trim_end_matches('/');
     if path.is_empty() || path == "/" {
         return false;
     }
-    if RUNTIME_SCRATCH_ROOTS.contains(&path) {
+    if tmpfs_roots
+        .iter()
+        .any(|root| root.trim_end_matches('/') == path)
+    {
         return true;
     }
-    volumes.iter().any(|v| {
-        let dest = v.container_path.trim_end_matches('/');
+    mount_destinations.iter().any(|dest| {
+        let dest = dest.trim_end_matches('/');
         !dest.is_empty() && (dest == path || dest.starts_with(&format!("{path}/")))
     })
 }
@@ -165,9 +189,25 @@ impl ContainerManager {
                 other => ContainerError::from(other),
             })?;
 
+        let mount_destinations: Vec<String> = inspect
+            .mounts
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| m.destination)
+            .filter(|d| !d.trim().is_empty())
+            .collect();
+        let tmpfs_roots: Vec<String> = inspect
+            .host_config
+            .as_ref()
+            .and_then(|h| h.tmpfs.as_ref())
+            .map(|tmpfs| tmpfs.keys().cloned().collect())
+            .unwrap_or_default();
+
         Ok(SourceForkFacts {
             image_id: inspect.image.clone().unwrap_or_default(),
             read_only_rootfs: inspect.host_config.as_ref().and_then(|h| h.readonly_rootfs),
+            mount_destinations,
+            tmpfs_roots,
         })
     }
 
@@ -194,11 +234,19 @@ impl ContainerManager {
                 return false;
             }
         };
+        // Fail closed: an unreadable diff is "unknown", never "clean".
         let changes = match self
-            .container_filesystem_changes(&params.source_container_id)
+            .container_filesystem_changes_checked(&params.source_container_id)
             .await
         {
-            Ok(changes) => changes,
+            Ok(Some(changes)) => changes,
+            Ok(None) => {
+                warn!(
+                    container = %params.source_container_id,
+                    "fork: daemon returned no diff (unknown), taking the commit path"
+                );
+                return false;
+            }
             Err(e) => {
                 warn!(
                     container = %params.source_container_id,
@@ -210,7 +258,8 @@ impl ContainerManager {
         };
         if !fork_can_reuse_source_image(
             &changes,
-            &params.volumes,
+            &facts.mount_destinations,
+            &facts.tmpfs_roots,
             facts.read_only_rootfs,
             Some(facts.image_id.as_str()),
         ) {
@@ -539,15 +588,23 @@ mod tests {
         }
     }
 
-    fn mount(dest: &str) -> VolumeMount {
-        VolumeMount::rw("/host/path", dest)
+    /// Source mount destinations, as `source_fork_facts` derives them from
+    /// `inspect.mounts` (the scaffolding oracle).
+    fn dests(list: &[&str]) -> Vec<String> {
+        list.iter().map(|d| (*d).to_string()).collect()
+    }
+
+    /// No tmpfs on the source: `fork_can_reuse_source_image` falls back to the
+    /// sandbox preset's scratch roots.
+    fn no_tmpfs() -> Vec<String> {
+        Vec::new()
     }
 
     /// The live scepter sandbox shape: read-only rootfs, tmpfs scratch, and the
     /// bind destinations scepter actually mounts (steps.rs re-adds /home,
     /// /workspace and /workspace-base around the inherited source mounts), plus
     /// the socket dir bind below tmpfs /tmp.
-    fn scepter_shape() -> (Vec<FilesystemChange>, Vec<VolumeMount>) {
+    fn scepter_shape() -> (Vec<FilesystemChange>, Vec<String>) {
         let changes = vec![
             // repo mounts inherited from the source (live buffer shape)
             change("/celestia"),
@@ -561,15 +618,15 @@ mod tests {
             change("/tmp"),
             change("/tmp/entelecheia-unix-socket"),
         ];
-        let volumes = vec![
-            mount("/celestia/entelecheia"),
-            mount("/celestia/evernight"),
-            mount("/workspace"),
-            mount("/workspace-base"),
-            mount("/home"),
-            mount("/tmp/entelecheia-unix-socket"),
-        ];
-        (changes, volumes)
+        let dests = dests(&[
+            "/celestia/entelecheia",
+            "/celestia/evernight",
+            "/workspace",
+            "/workspace-base",
+            "/home",
+            "/tmp/entelecheia-unix-socket",
+        ]);
+        (changes, dests)
     }
 
     #[test]
@@ -586,6 +643,7 @@ mod tests {
         assert!(fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
             Some(true),
             Some("sha256:c49ba4b956a5")
         ));
@@ -596,7 +654,8 @@ mod tests {
         // A brand-new container whose rootfs is read-only reports no changes at all.
         assert!(fork_can_reuse_source_image(
             &[],
-            &[mount("/celestia/entelecheia")],
+            &dests(&["/celestia/entelecheia"]),
+            &no_tmpfs(),
             Some(true),
             Some("sha256:c49ba4b956a5")
         ));
@@ -609,10 +668,58 @@ mod tests {
             path: "/celestia".to_string(),
             kind: ChangeType::_2,
         }];
-        let volumes = vec![mount("/celestia/entelecheia")];
+        let volumes = dests(&["/celestia/entelecheia"]);
         assert!(!fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+    }
+
+    /// The oracle must be the SOURCE's own mounts, not the fork's requested
+    /// `params.volumes`: a destination only the fork will mount never masked
+    /// anything in the source's layer, so an entry there is real content.
+    #[test]
+    fn a_fork_only_mount_destination_is_not_scaffolding() {
+        let changes = vec![change("/data/sub")];
+        // The source mounts nothing under /data (it would only be mounted by the
+        // fork), so the entry must force a commit.
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &[],
+            &no_tmpfs(),
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+        // The same entry IS scaffolding once the source really mounts there.
+        assert!(fork_can_reuse_source_image(
+            &changes,
+            &dests(&["/data/sub"]),
+            &no_tmpfs(),
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+    }
+
+    #[test]
+    fn tmpfs_roots_come_from_the_source_when_reported() {
+        let changes = vec![change("/scratch")];
+        // A source-declared tmpfs root is scaffolding even though it is not one
+        // of the preset's scratch paths.
+        assert!(fork_can_reuse_source_image(
+            &changes,
+            &[],
+            &dests(&["/scratch"]),
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+        // Without a source tmpfs and without a mount, the same path is content.
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &[],
+            &[],
             Some(true),
             Some("sha256:c49ba4b956a5")
         ));
@@ -625,6 +732,7 @@ mod tests {
         assert!(!fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
             Some(true),
             Some("sha256:c49ba4b956a5")
         ));
@@ -639,6 +747,7 @@ mod tests {
         assert!(!fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
             Some(true),
             Some("sha256:c49ba4b956a5")
         ));
@@ -651,6 +760,7 @@ mod tests {
         assert!(!fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
             Some(true),
             Some("sha256:c49ba4b956a5")
         ));
@@ -662,11 +772,18 @@ mod tests {
         assert!(!fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
             Some(false),
             Some("sha256:c49ba4b956a5")
         ));
         assert!(
-            !fork_can_reuse_source_image(&changes, &volumes, None, Some("sha256:c49ba4b956a5")),
+            !fork_can_reuse_source_image(
+                &changes,
+                &volumes,
+                &no_tmpfs(),
+                None,
+                Some("sha256:c49ba4b956a5")
+            ),
             "an unknown rootfs mode is not proof of cleanliness"
         );
     }
@@ -677,12 +794,14 @@ mod tests {
         assert!(!fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
             Some(true),
             None
         ));
         assert!(!fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
             Some(true),
             Some("   ")
         ));
@@ -691,10 +810,11 @@ mod tests {
     #[test]
     fn nested_bind_destination_marks_its_ancestor_as_scaffolding() {
         let changes = vec![change("/work"), change("/work/sub")];
-        let volumes = vec![mount("/work/sub")];
+        let volumes = dests(&["/work/sub"]);
         assert!(fork_can_reuse_source_image(
             &changes,
             &volumes,
+            &no_tmpfs(),
             Some(true),
             Some("sha256:aa")
         ));
@@ -702,8 +822,8 @@ mod tests {
 
     #[test]
     fn root_and_empty_paths_are_never_scaffolding() {
-        assert!(!is_runtime_scaffold("/", &[]));
-        assert!(!is_runtime_scaffold("", &[]));
+        assert!(!is_runtime_scaffold("/", &[], &no_tmpfs()));
+        assert!(!is_runtime_scaffold("", &[], &no_tmpfs()));
     }
 
     #[test]

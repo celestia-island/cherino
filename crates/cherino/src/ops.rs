@@ -51,10 +51,13 @@ pub trait ContainerOps: Send + Sync {
         options: ForkOptions,
     ) -> ContainerResult<ContainerInfo> {
         if options.clean_layer {
-            return Err(ContainerError::OperationFailed {
-                container_id: params.source_container_id.clone(),
-                message: "clean-layer fork is not supported by this backend".to_string(),
-            });
+            // `UnsupportedBackend` rather than a generic operation failure: the
+            // caller asked for a capability this backend does not have, and a
+            // consumer branching on the taxonomy must be able to tell that apart
+            // from a fork that failed while doing real work.
+            return Err(ContainerError::UnsupportedBackend(
+                "fork_with_options:clean_layer".to_string(),
+            ));
         }
         self.fork(params).await
     }
@@ -342,12 +345,8 @@ mod tests {
             .await
             .expect_err("a non-supporting backend must not accept clean_layer");
         assert!(
-            matches!(err, ContainerError::OperationFailed { .. }),
-            "expected OperationFailed, got {err:?}"
-        );
-        assert!(
-            format!("{err}").contains("clean-layer"),
-            "the refusal must name the unsupported switch: {err}"
+            matches!(&err, ContainerError::UnsupportedBackend(m) if m.contains("clean_layer")),
+            "the refusal must surface as UnsupportedBackend naming the switch: {err:?}"
         );
     }
 

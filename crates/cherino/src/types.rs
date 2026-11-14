@@ -238,7 +238,7 @@ pub struct ContainerForkParams {
     pub read_only_rootfs: Option<bool>,
 }
 
-/// Opt-in switches for [`ContainerManager::fork_with_options`].
+/// Opt-in switches for `ContainerManager::fork_with_options`.
 ///
 /// Deliberately a separate struct instead of new fields on
 /// [`ContainerForkParams`]: every consumer in the org builds that struct with an

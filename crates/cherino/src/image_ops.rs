@@ -24,10 +24,12 @@ const COSMOS_SNAPSHOT_PREFIX: &str = "cosmos-snapshot-";
 /// tmpfs mount never enter the writable layer, so a change record naming the
 /// mount root itself is scaffolding. A record *below* one is deliberately not
 /// scaffolding: seeing it proves the path is a real directory, i.e. the
-/// container has genuine state there.
+/// container has genuine state there. tmpfs ancestors are NOT honoured (only
+/// exact tmpfs roots), so `/var` next to a `/var/tmp` tmpfs still forces a commit.
 const FALLBACK_TMPFS_ROOTS: [&str; 3] = super::security_profile::READONLY_SCRATCH_PATHS;
 
 /// What the fast path needs to know about the source container.
+#[derive(Debug, Clone)]
 struct SourceForkFacts {
     image_id: String,
     /// The source's own `HostConfig.ReadonlyRootfs`, not the fork's requested one.
@@ -38,6 +40,14 @@ struct SourceForkFacts {
     mount_destinations: Vec<String>,
     /// tmpfs roots reported by the source (fallback: `FALLBACK_TMPFS_ROOTS`).
     tmpfs_roots: Vec<String>,
+    /// `Config.WorkingDir` of the source container. `docker commit` bakes it into
+    /// the new image, so the tag path has to carry it into the fork's create
+    /// params explicitly or the fork would start in the image's directory.
+    working_dir: Option<String>,
+    /// `Config.Healthcheck` of the source container — same reasoning: a tag keeps
+    /// the *image's* probe, and scepter intentionally overrides it (the cosmos
+    /// socket-aware check) at container-create time.
+    healthcheck: Option<super::types::HealthcheckParams>,
 }
 
 /// True when a fork may start from the source container's own image instead of
@@ -48,8 +58,8 @@ struct SourceForkFacts {
 ///    `mount -o remount,rw /` inside the container is possible and would leave
 ///    the flag set while content reached the layer — the diff catches that);
 /// 2. every recorded change is runtime scaffolding — a destination the *source*
-///    mounts, a tmpfs root the source has, or an ancestor directory of a source
-///    mount destination (tmpfs roots are top-level, so they have no ancestor);
+///    mounts, a tmpfs root the source has, or an ancestor directory of one of the
+///    source's mount destinations;
 /// 3. the source image id resolved, so there is an image to fork from.
 ///
 /// Anything else (a real write, a writable or unknown rootfs, an unresolved
@@ -203,11 +213,28 @@ impl ContainerManager {
             .map(|tmpfs| tmpfs.keys().cloned().collect())
             .unwrap_or_default();
 
+        let config = inspect.config.as_ref();
+        let working_dir = config
+            .and_then(|c| c.working_dir.clone())
+            .filter(|d| !d.trim().is_empty());
+        let healthcheck =
+            config
+                .and_then(|c| c.healthcheck.as_ref())
+                .map(|hc| super::types::HealthcheckParams {
+                    test: hc.test.clone().unwrap_or_default(),
+                    interval_ns: hc.interval,
+                    timeout_ns: hc.timeout,
+                    retries: hc.retries,
+                    start_period_ns: hc.start_period,
+                });
+
         Ok(SourceForkFacts {
             image_id: inspect.image.clone().unwrap_or_default(),
             read_only_rootfs: inspect.host_config.as_ref().and_then(|h| h.readonly_rootfs),
             mount_destinations,
             tmpfs_roots,
+            working_dir,
+            healthcheck,
         })
     }
 
@@ -222,7 +249,7 @@ impl ContainerManager {
         &self,
         params: &ContainerForkParams,
         image_tag: &str,
-    ) -> bool {
+    ) -> Option<SourceForkFacts> {
         let facts = match self.source_fork_facts(&params.source_container_id).await {
             Ok(facts) => facts,
             Err(e) => {
@@ -231,7 +258,7 @@ impl ContainerManager {
                     error = %e,
                     "fork: source inspect failed, taking the commit path"
                 );
-                return false;
+                return None;
             }
         };
         // Fail closed: an unreadable diff is "unknown", never "clean".
@@ -245,7 +272,7 @@ impl ContainerManager {
                     container = %params.source_container_id,
                     "fork: daemon returned no diff (unknown), taking the commit path"
                 );
-                return false;
+                return None;
             }
             Err(e) => {
                 warn!(
@@ -253,7 +280,7 @@ impl ContainerManager {
                     error = %e,
                     "fork: source diff failed, taking the commit path"
                 );
-                return false;
+                return None;
             }
         };
         if !fork_can_reuse_source_image(
@@ -263,7 +290,7 @@ impl ContainerManager {
             facts.read_only_rootfs,
             Some(facts.image_id.as_str()),
         ) {
-            return false;
+            return None;
         }
 
         let (repo, tag) = split_repo_tag(image_tag);
@@ -282,7 +309,7 @@ impl ContainerManager {
                 error = %e,
                 "fork: tagging the clean source image failed, taking the commit path"
             );
-            return false;
+            return None;
         }
 
         info!(
@@ -299,7 +326,7 @@ impl ContainerManager {
                 "fork: commit labels are not carried by the clean-layer fast path"
             );
         }
-        true
+        Some(facts)
     }
 
     pub async fn fork(&self, params: &ContainerForkParams) -> ContainerResult<ContainerInfo> {
@@ -323,8 +350,12 @@ impl ContainerManager {
         // commit would mint an image identical to the source image at ~0.95 s of
         // daemon work. Tag the source image under the fork tag instead so
         // `remove_with_image` keeps its `cosmos-fork-*` cleanup contract.
-        let reuse_source_image =
-            options.clean_layer && self.reuse_source_image_if_clean(params, &image_tag).await;
+        let fast_facts = if options.clean_layer {
+            self.reuse_source_image_if_clean(params, &image_tag).await
+        } else {
+            None
+        };
+        let reuse_source_image = fast_facts.is_some();
 
         if !reuse_source_image {
             self.commit_with_labels(
@@ -350,10 +381,13 @@ impl ContainerManager {
             ports: Vec::new(),
             volumes: params.volumes.clone(),
             labels: params.labels.clone(),
-            working_dir: None,
+            // On the fast path the fork image is a tag of the source image, so it
+            // does NOT carry the source container's Config. `docker commit` would
+            // have baked these in; carry them explicitly instead.
+            working_dir: fast_facts.as_ref().and_then(|f| f.working_dir.clone()),
             log_driver: None,
             log_opts: HashMap::new(),
-            healthcheck: None,
+            healthcheck: fast_facts.as_ref().and_then(|f| f.healthcheck.clone()),
             user: params.user.clone(),
             memory_limit: params.memory_limit,
             nano_cpus: params.nano_cpus,
@@ -681,6 +715,25 @@ mod tests {
     /// The oracle must be the SOURCE's own mounts, not the fork's requested
     /// `params.volumes`: a destination only the fork will mount never masked
     /// anything in the source's layer, so an entry there is real content.
+    /// The ancestor test must respect path segments: a destination `/home` may
+    /// never whitelist a diff path `/home2`.
+    #[test]
+    fn a_sibling_path_prefix_is_not_scaffolding() {
+        for (dest, path) in [("/home", "/home2"), ("/workspace", "/workspace-base")] {
+            let changes = vec![change(path)];
+            assert!(
+                !fork_can_reuse_source_image(
+                    &changes,
+                    &dests(&[dest]),
+                    &no_tmpfs(),
+                    Some(true),
+                    Some("sha256:c49ba4b956a5")
+                ),
+                "{path} must not be swallowed by a destination {dest}"
+            );
+        }
+    }
+
     #[test]
     fn a_fork_only_mount_destination_is_not_scaffolding() {
         let changes = vec![change("/data/sub")];
@@ -870,6 +923,17 @@ mod tests {
         let source = manager
             .create(&super::super::types::ContainerCreateParams {
                 read_only_rootfs: Some(true),
+                // Set only on the container (the image has none): the tag path must
+                // carry these into the fork's create params, the commit path bakes
+                // them into the image, so both forks must end up with them.
+                working_dir: Some("/home".to_string()),
+                healthcheck: Some(super::super::types::HealthcheckParams {
+                    test: vec!["CMD".to_string(), "true".to_string()],
+                    interval_ns: Some(30_000_000_000),
+                    timeout_ns: Some(5_000_000_000),
+                    retries: Some(3),
+                    start_period_ns: Some(5_000_000_000),
+                }),
                 ..super::super::types::ContainerCreateParams::simple(source_name, image.clone())
             })
             .await

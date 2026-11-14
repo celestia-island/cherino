@@ -749,6 +749,27 @@ mod tests {
     }
 
     #[test]
+    fn cosmos_profile_adds_exactly_mount_and_umount2() -> Result<()> {
+        // Pinned literally, not through the const: a test that reads the same
+        // list it is validating can never notice the list changing.
+        let default = SeccompProfile::EntelecheiaDefault.to_profile_data();
+        let cosmos = SeccompProfile::Cosmos.to_profile_data();
+        let allow = rule(&cosmos, "SCMP_ACT_ALLOW")?;
+        let default_allow = rule(&default, "SCMP_ACT_ALLOW")?;
+        let added: Vec<&str> = allow
+            .names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !default_allow.names.iter().any(|n| n == name))
+            .collect();
+        ensure!(
+            added == vec!["mount", "umount2"],
+            "the cosmos preset must add exactly [mount, umount2], got {added:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cosmos_profile_keeps_the_kernel_escape_surface_denied() -> Result<()> {
         // The point of the whole change: the FUSE/OCI family becomes reachable,
         // the kernel-attack surface does not.

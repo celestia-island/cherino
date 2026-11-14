@@ -486,3 +486,52 @@ fn named_apparmor_profile_scopes_the_mount_target() {
         String::from_utf8_lossy(&fuse.stderr)
     );
 }
+
+/// The request-shape guard is wired into `create()`: a `security_opt` list whose
+/// `mount` is unproven must be refused **before** anything starts, so a
+/// mispaired container never runs and never leaks.
+#[tokio::test]
+#[ignore = "requires docker + CHERINO_SECCOMP_TEST_IMAGE"]
+async fn create_refuses_a_mispaired_security_list_without_starting_a_container() {
+    let Some(image) = image() else {
+        panic!("set CHERINO_SECCOMP_TEST_IMAGE");
+    };
+    let manager = cherino::ContainerManager::new().expect("docker connection");
+    let name = format!("cherino-r2-mispaired-{}", std::process::id());
+
+    let mut params = cherino::types::ContainerCreateParams::simple(name.clone(), image);
+    params.network = Some("bridge".to_string());
+    // seccomp admits mount, AppArmor is unconfined: nothing scopes the target.
+    params.security_opt = Some({
+        let mut opts = vec![
+            format!(
+                "seccomp={}",
+                cherino::seccomp::SeccompProfile::Cosmos
+                    .to_json_string()
+                    .expect("profile")
+            ),
+            "apparmor=unconfined".to_string(),
+        ];
+        opts.push("no-new-privileges:true".to_string());
+        opts
+    });
+
+    match manager.create(&params).await {
+        Err(cherino::ContainerError::SecurityProfileDrift { drift, .. }) => {
+            assert!(
+                drift.contains("AppArmor") || drift.contains("scoped"),
+                "the refusal must name the missing mediation: {drift}"
+            );
+        }
+        other => panic!("a mispaired list must be refused, got {other:?}"),
+    }
+    // Nothing was created: the guard runs before create_container.
+    let listed = manager
+        .list_with_filter(Some(&name), None, true)
+        .await
+        .expect("list");
+    assert!(
+        listed.is_empty(),
+        "create must not leave a container behind: {listed:?}"
+    );
+}

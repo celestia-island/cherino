@@ -39,6 +39,16 @@ fn default_network() -> String {
         .unwrap_or_else(|| DEFAULT_NETWORK.to_string())
 }
 
+/// Outcome of the post-start security self-check. Transport failures are kept
+/// apart from real drift so a flaky inspect never reads as "the profile was
+/// downgraded".
+enum ProfileCheck {
+    /// Every requested option is recorded on the container.
+    Applied,
+    /// The container is missing something it was asked for (keys only).
+    Drift(String),
+}
+
 impl ContainerManager {
     /// Asserts that the live container carries every security option the
     /// profile requested (see `security_profile::verify_effective_security_opts`
@@ -52,7 +62,7 @@ impl ContainerManager {
         &self,
         container_id: &str,
         requested: &[String],
-    ) -> ContainerResult<()> {
+    ) -> ContainerResult<ProfileCheck> {
         let inspected = self
             .docker
             .inspect_container(container_id, None)
@@ -74,12 +84,36 @@ impl ContainerManager {
             .host_config
             .and_then(|host| host.security_opt)
             .unwrap_or_default();
-        security_profile::verify_effective_security_opts(requested, &actual).map_err(|drift| {
-            ContainerError::SecurityProfileDrift {
-                container_id: container_id.to_string(),
-                drift: drift.summary(),
-            }
-        })
+        Ok(
+            match security_profile::verify_effective_security_opts(requested, &actual) {
+                Ok(()) => ProfileCheck::Applied,
+                Err(drift) => ProfileCheck::Drift(drift.summary()),
+            },
+        )
+    }
+
+    /// Best-effort teardown of a container whose security profile could not be
+    /// confirmed. The removal error is logged rather than discarded silently:
+    /// the caller is told the create failed, and an operator needs to know if a
+    /// container outlived that.
+    async fn remove_after_failed_security_check(&self, container_id: &str) {
+        if let Err(error) = self
+            .docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            warn!(
+                container_id,
+                error = %error,
+                "removal after a failed security check also failed — the container may still exist"
+            );
+        }
     }
 
     pub async fn create(&self, params: &ContainerCreateParams) -> ContainerResult<ContainerInfo> {
@@ -271,27 +305,38 @@ impl ContainerManager {
         // Compare what the runtime actually recorded against what the profile
         // requested, and tear the container down on any drift: a caller must
         // never receive a sandbox whose profile is weaker than declared.
-        if let Err(drift) = self
+        match self
             .verify_security_profile(&response.id, &security_opt)
             .await
         {
-            warn!(
-                container = %params.name,
-                container_id = %response.id,
-                error = %drift,
-                "security profile drift — removing the container instead of returning it"
-            );
-            let _ = self
-                .docker
-                .remove_container(
-                    &response.id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
-            return Err(drift);
+            Ok(ProfileCheck::Applied) => {}
+            // The check could not run (transport/API failure, or the container
+            // vanished): fail closed, but report the real cause instead of
+            // calling a 500 "profile drift" and tearing down a container that
+            // may be perfectly healthy.
+            Err(error) => {
+                warn!(
+                    container = %params.name,
+                    container_id = %response.id,
+                    error = %error,
+                    "security profile could not be verified — removing the container"
+                );
+                self.remove_after_failed_security_check(&response.id).await;
+                return Err(error);
+            }
+            Ok(ProfileCheck::Drift(drift)) => {
+                warn!(
+                    container = %params.name,
+                    container_id = %response.id,
+                    error = %drift,
+                    "security profile drift — removing the container instead of returning it"
+                );
+                self.remove_after_failed_security_check(&response.id).await;
+                return Err(ContainerError::SecurityProfileDrift {
+                    container_id: response.id.clone(),
+                    drift,
+                });
+            }
         }
 
         if !network.is_empty() {

@@ -273,6 +273,17 @@ fn is_runtime_scaffold(
             .any(|dest| dest.trim_end_matches('/').starts_with(&format!("{path}/")))
 }
 
+/// Whether a `cosmos-fork-*` ref must be untagged only rather than force-removed.
+///
+/// `repo_tags` counts every name the image has (including the fork tag itself) and
+/// `containers` counts containers built from it. A privately minted fork image has
+/// exactly one tag and, once its own container is gone, no container: it may be
+/// force-removed. Anything shared (another tag, or another container) must only be
+/// untagged — `docker rmi -f` on a sole-tagged image deletes the image outright.
+fn fork_tag_is_shared_with(repo_tags: usize, containers: usize) -> bool {
+    repo_tags > 1 || containers > 0
+}
+
 /// `repo:tag` → (`repo`, `tag`); a bare repository resolves to `latest`, the
 /// same default the commit path gets from Docker.
 fn split_repo_tag(image_tag: &str) -> (String, String) {
@@ -299,7 +310,12 @@ impl ContainerManager {
         self.remove(container_id, force).await?;
 
         if image.starts_with(COSMOS_FORK_PREFIX) || image.starts_with(COSMOS_SNAPSHOT_PREFIX) {
-            self.remove_image(image, true).await?;
+            // A commit-path fork owns a privately minted image: force-removing it
+            // frees space. A clean-layer fork's tag ALIASES the source image, and
+            // `docker rmi -f` on a sole-tagged image DELETES it (measured on this
+            // daemon) — so an alias must only ever be untagged.
+            let force = !self.fork_tag_is_shared(image).await;
+            self.remove_image(image, force).await?;
         }
 
         Ok(())
@@ -635,6 +651,39 @@ impl ContainerManager {
         }
     }
 
+    /// True when `image` (a `cosmos-fork-*` ref) aliases an image that something
+    /// else still needs: another repo tag on the same image, or another container
+    /// built from it. Any probe error answers `true`, because the safe mistake is
+    /// leaving a tag behind, never deleting a shared image.
+    async fn fork_tag_is_shared(&self, image: &str) -> bool {
+        let (repo_tags, image_id) = match self.docker.inspect_image(image).await {
+            Ok(inspect) => (
+                inspect.repo_tags.unwrap_or_default().len(),
+                inspect.id.unwrap_or_default(),
+            ),
+            Err(_) => return true,
+        };
+        let containers = if image_id.is_empty() {
+            0
+        } else {
+            let mut filters = HashMap::new();
+            filters.insert("ancestor".to_string(), vec![image_id.clone()]);
+            match self
+                .docker
+                .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                    all: true,
+                    filters: Some(filters),
+                    ..Default::default()
+                }))
+                .await
+            {
+                Ok(list) => list.len(),
+                Err(_) => return true,
+            }
+        };
+        fork_tag_is_shared_with(repo_tags, containers)
+    }
+
     pub async fn remove_image(&self, image: &str, force: bool) -> ContainerResult<()> {
         let options = RemoveImageOptions {
             force,
@@ -858,8 +907,9 @@ mod tests {
         list.iter().map(|d| (*d).to_string()).collect()
     }
 
-    /// No tmpfs on the source: `fork_can_reuse_source_image` falls back to the
-    /// sandbox preset's scratch roots.
+    /// No tmpfs reported by the source. There is deliberately no preset fallback
+    /// (see `FALLBACK`-free comment on `fast_path_allowed`): a source that reports
+    /// no tmpfs has a real `/tmp`, so an entry there must force a commit.
     fn no_tmpfs() -> Vec<String> {
         Vec::new()
     }
@@ -1320,6 +1370,24 @@ mod tests {
             &mounts,
             &no_tmpfs()
         ));
+    }
+
+    /// Retirement must never force-delete a shared image: a clean-layer fork's tag
+    /// aliases the source image, and `docker rmi -f` deletes a sole-tagged image
+    /// (measured: `Deleted: sha256:…`). Only a privately minted fork image — one
+    /// tag, no containers — may be force-removed.
+    #[test]
+    fn fork_tag_is_only_force_removed_when_private() {
+        assert!(fork_tag_is_shared_with(2, 0), "another tag means shared");
+        assert!(
+            fork_tag_is_shared_with(1, 1),
+            "a container using the image means shared"
+        );
+        assert!(fork_tag_is_shared_with(3, 2));
+        assert!(
+            !fork_tag_is_shared_with(1, 0),
+            "a lone tag with no container is a private mint"
+        );
     }
 
     /// `with_clean_layer` is the only way an external caller can enable the

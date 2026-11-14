@@ -18,16 +18,6 @@ use super::{
 const COSMOS_FORK_PREFIX: &str = "cosmos-fork-";
 const COSMOS_SNAPSHOT_PREFIX: &str = "cosmos-snapshot-";
 
-/// Fallback when the source container reports no tmpfs at all: the sandbox
-/// preset's list (`security_profile::READONLY_SCRATCH_PATHS`), which
-/// `apply_readonly_scratch` installs on every read-only rootfs. Contents of a
-/// tmpfs mount never enter the writable layer, so a change record naming the
-/// mount root itself is scaffolding. A record *below* one is deliberately not
-/// scaffolding: seeing it proves the path is a real directory, i.e. the
-/// container has genuine state there. tmpfs ancestors are NOT honoured (only
-/// exact tmpfs roots), so `/var` next to a `/var/tmp` tmpfs still forces a commit.
-const FALLBACK_TMPFS_ROOTS: [&str; 3] = super::security_profile::READONLY_SCRATCH_PATHS;
-
 /// What the fast path needs to know about the source container.
 #[derive(Debug, Clone)]
 struct SourceForkFacts {
@@ -38,7 +28,8 @@ struct SourceForkFacts {
     /// fork's `params.volumes` — is the scaffolding oracle: a diff describes the
     /// source's layer, so only paths the *source* masked are content-free.
     mount_destinations: Vec<String>,
-    /// tmpfs roots reported by the source (fallback: `FALLBACK_TMPFS_ROOTS`).
+    /// tmpfs roots the source actually reports (`HostConfig.Tmpfs`). Empty means
+    /// "no tmpfs", which makes any `/tmp` entry content rather than scaffolding.
     tmpfs_roots: Vec<String>,
     /// `Config.WorkingDir` of the source container. `docker commit` bakes it into
     /// the new image, so the tag path has to carry it into the fork's create
@@ -58,8 +49,8 @@ struct SourceForkFacts {
 ///    `mount -o remount,rw /` inside the container is possible and would leave
 ///    the flag set while content reached the layer — the diff catches that);
 /// 2. every recorded change is runtime scaffolding — a destination the *source*
-///    mounts, a tmpfs root the source has, or an ancestor directory of one of the
-///    source's mount destinations;
+///    mounts, an exact tmpfs root the source reports, or an ancestor directory of
+///    one of the source's mount destinations (tmpfs ancestors are not honoured);
 /// 3. the source image id resolved, so there is an image to fork from.
 ///
 /// Anything else (a real write, a writable or unknown rootfs, an unresolved
@@ -82,12 +73,12 @@ pub fn fork_can_reuse_source_image(
     if image_id.trim().is_empty() {
         return false;
     }
-    let fallback_tmpfs: Vec<String> = FALLBACK_TMPFS_ROOTS.iter().map(|s| s.to_string()).collect();
-    let tmpfs: &[String] = if source_tmpfs_roots.is_empty() {
-        &fallback_tmpfs
-    } else {
-        source_tmpfs_roots
-    };
+    // No preset fallback on purpose: only tmpfs mounts the SOURCE actually reports
+    // can mask layer content. A source created outside cherino (no `--tmpfs`) has a
+    // real `/tmp`, where a write shows up as `A /tmp` (a file, and `docker diff`
+    // carries no type) — a preset fallback would classify that as scaffolding and
+    // silently drop it. With no reported tmpfs, such an entry forces a commit.
+    let tmpfs: &[String] = source_tmpfs_roots;
     changes.iter().all(|c| {
         // A delete means real content left the layer, so it is never scaffolding
         // even at a mount path (which a live mount makes undeletable anyway).
@@ -754,6 +745,25 @@ mod tests {
             Some(true),
             Some("sha256:c49ba4b956a5")
         ));
+    }
+
+    /// No preset fallback: a source that reports no tmpfs has a real `/tmp`, and a
+    /// write there must force a commit rather than be read as a scratch mount.
+    #[test]
+    fn a_source_tmpfs_entry_without_reported_tmpfs_forces_a_commit() {
+        for path in ["/tmp", "/run", "/var/tmp"] {
+            let changes = vec![change(path)];
+            assert!(
+                !fork_can_reuse_source_image(
+                    &changes,
+                    &[],
+                    &[],
+                    Some(true),
+                    Some("sha256:c49ba4b956a5")
+                ),
+                "{path} must be content when the source reports no tmpfs"
+            );
+        }
     }
 
     #[test]

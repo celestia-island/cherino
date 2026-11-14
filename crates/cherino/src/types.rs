@@ -247,6 +247,7 @@ pub struct ContainerForkParams {
 /// breaks all of them at the next dependency pickup, including consumers this
 /// PR is not allowed to touch.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ForkOptions {
     /// Skip the redundant `docker commit` when the source container's writable
     /// layer provably holds no state: read-only source rootfs, a filesystem diff
@@ -257,6 +258,22 @@ pub struct ForkOptions {
     /// Default `false` — opt-in until the L2 path is field-validated. See
     /// [`crate::image_ops::fork_can_reuse_source_image`].
     pub clean_layer: bool,
+}
+
+impl ForkOptions {
+    /// Opt in (or out) of the clean-layer fast path.
+    ///
+    /// Preferred over a struct literal: `ForkOptions` is `#[non_exhaustive]`, so a
+    /// switch added later cannot break callers that build it through this method.
+    pub fn with_clean_layer(mut self, enabled: bool) -> Self {
+        self.clean_layer = enabled;
+        self
+    }
+
+    /// Whether the clean-layer fast path was requested.
+    pub fn clean_layer_enabled(&self) -> bool {
+        self.clean_layer
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, cherino_macros::Getters)]

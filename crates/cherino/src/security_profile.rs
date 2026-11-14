@@ -194,6 +194,20 @@ impl SecurityOptDrift {
 /// assumed. Lists whose seccomp profile denies `mount` (the default and
 /// `compile` presets) are fine on their own.
 pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
+    // Duplicated keys make the list ambiguous: which entry a runtime applies is
+    // not defined, so nothing about it is provable.
+    for key in requested.iter().map(|opt| security_opt_key(opt)) {
+        if requested
+            .iter()
+            .filter(|opt| security_opt_key(opt) == key)
+            .count()
+            > 1
+        {
+            return Err(format!(
+                "`{key}` appears more than once in security_opt; which entry the runtime                  applies is undefined, so the boundary is unprovable"
+            ));
+        }
+    }
     // A named AppArmor profile is the thing that scopes `mount(2)`'s target, so
     // its presence is sufficient and its absence is what must be disproved.
     let named_apparmor = requested
@@ -205,14 +219,29 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
         return Ok(());
     }
     // Fail closed: without AppArmor, the only acceptable list is one whose
-    // seccomp profile **provably denies** `mount`. Anything we cannot parse —
-    // `seccomp=unconfined`, a profile path, no seccomp entry at all — is
-    // unproven, and unproven means refused.
+    // seccomp profile **provably denies** `mount`. "Provably" means a refusing
+    // default action *and* no `SCMP_ACT_ALLOW` rule naming `mount` — a profile
+    // with `defaultAction: SCMP_ACT_ALLOW` and no rules denies nothing, so it
+    // must not be read as proof. Anything we cannot parse — `seccomp=unconfined`,
+    // a profile path, no seccomp entry at all — is unproven, and unproven means
+    // refused.
     let denies_mount = requested
         .iter()
         .find(|opt| security_opt_key(opt) == "seccomp")
         .and_then(|opt| serde_json::from_str::<serde_json::Value>(security_opt_value(opt)).ok())
         .is_some_and(|profile| {
+            let refusing_default = profile["defaultAction"]
+                .as_str()
+                .is_some_and(|action| {
+                    matches!(
+                        action,
+                        "SCMP_ACT_ERRNO"
+                            | "SCMP_ACT_KILL"
+                            | "SCMP_ACT_KILL_THREAD"
+                            | "SCMP_ACT_KILL_PROCESS"
+                            | "SCMP_ACT_TRAP"
+                    )
+                });
             let allows_mount = profile["syscalls"].as_array().is_some_and(|rules| {
                 rules.iter().any(|rule| {
                     rule["action"] == "SCMP_ACT_ALLOW"
@@ -221,7 +250,7 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
                             .is_some_and(|names| names.iter().any(|name| name == "mount"))
                 })
             });
-            !allows_mount
+            refusing_default && !allows_mount
         });
     if denies_mount {
         return Ok(());
@@ -945,6 +974,36 @@ mod tests {
         ensure!(
             verify_mount_mediation(&opts).is_ok(),
             "a named AppArmor profile is what scopes mount(2)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_default_allow_profile_is_not_proof_of_denial() -> Result<()> {
+        // `defaultAction: SCMP_ACT_ALLOW` with no rules denies nothing; reading
+        // "no ALLOW rule names mount" as proof would wave it through.
+        let permissive = r#"{"defaultAction":"SCMP_ACT_ALLOW","architectures":[],"syscalls":[]}"#;
+        let opts = vec![format!("seccomp={permissive}")];
+        ensure!(
+            verify_mount_mediation(&opts).is_err(),
+            "a default-allow profile must not count as denying mount"
+        );
+        // A refusing default with no mount grant is the real proof.
+        let refusing = r#"{"defaultAction":"SCMP_ACT_ERRNO","architectures":[],"syscalls":[]}"#;
+        ensure!(
+            verify_mount_mediation(&[format!("seccomp={refusing}")]).is_ok(),
+            "a refusing default action with no mount grant is proof"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_keys_make_the_boundary_unprovable() -> Result<()> {
+        let mut opts = cosmos_security_opts();
+        opts.push("seccomp=unconfined".to_string());
+        ensure!(
+            verify_mount_mediation(&opts).is_err(),
+            "two seccomp entries mean the applied one is undefined"
         );
         Ok(())
     }

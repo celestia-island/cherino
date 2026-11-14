@@ -491,9 +491,18 @@ impl SeccompProfileData {
     /// `fsopen`/`fsconfig`/`fsmount`/… otherwise, with no classic fallback
     /// (`libcontainer-0.7.0/src/rootfs/mount.rs`) — and AppArmor does not
     /// mediate that API on kernel 6.1, so admitting it would reopen the
-    /// mount-authority bypass this profile exists to close. (Its one classic
-    /// `mount(2)` call is the `MS_PRIVATE` propagation remount, which does
-    /// succeed here — that does not rescue the runtime, it fails earlier.) Consequence, stated
+    /// mount-authority bypass this profile exists to close.
+    ///
+    /// For accuracy about *why* it fails: libcontainer does make classic
+    /// `mount(2)` calls, and they run first and succeed — the root propagation
+    /// remount (`rootfs/rootfs.rs:52`), the rootfs self-bind
+    /// (`rootfs/rootfs.rs:68-75`), `Mount::make_parent_mount_private`
+    /// (`rootfs/mount.rs:557`), the `/dev` node binds (`rootfs/device.rs:127`)
+    /// and the init-process mounts (`process/init/process.rs:211,523,542,591,707,729`).
+    /// Every mount that comes from the OCI spec then goes through the fd-based
+    /// path and fails with EPERM. So the failure is *after* the classic calls,
+    /// not before them: those calls succeed and are simply not the mounts that
+    /// matter. Consequence, stated
     /// as a supported limit: **a cosmos container that hosts the inner OCI
     /// runtime cannot run under this filter** — its first inner mount returns
     /// EPERM (fail-closed, loudly). Reconciling the two needs either a substrate

@@ -75,12 +75,23 @@ fn unsupported_docker_host(raw: &str) -> ContainerError {
 }
 
 pub fn connect_local() -> ContainerResult<Docker> {
-    match docker_host_transport(std::env::var("DOCKER_HOST").ok().as_deref()) {
-        Ok(Some(DockerHostTransport::Http(host))) => connect_http(&host),
-        Ok(Some(DockerHostTransport::Unix(path))) => connect_socket(&path),
-        Ok(None) => Docker::connect_with_local_defaults()
+    dispatch_docker_host(std::env::var("DOCKER_HOST").ok().as_deref())
+}
+
+/// The dispatch behind [`connect_local`], with the value injected so every arm can
+/// be pinned without touching the process environment.
+///
+/// The arms are distinguishable without a daemon because bollard is asymmetric:
+/// `connect_with_http` performs no eager validation (a lazy client is `Ok`), while
+/// `connect_with_socket` eagerly `exists()`-checks the path (a missing socket is
+/// an `Err`). A mutation that swaps the arms, drops the error arm, or ignores the
+/// value therefore changes an observable result instead of staying green.
+pub(crate) fn dispatch_docker_host(value: Option<&str>) -> ContainerResult<Docker> {
+    match docker_host_transport(value)? {
+        Some(DockerHostTransport::Http(host)) => connect_http(&host),
+        Some(DockerHostTransport::Unix(path)) => connect_socket(&path),
+        None => Docker::connect_with_local_defaults()
             .map_err(|e| ContainerError::Connection(e.to_string())),
-        Err(e) => Err(e),
     }
 }
 
@@ -155,6 +166,35 @@ mod tests {
         }
     }
 
+    /// The dispatch arms, pinned by bollard's eager/lazy asymmetry: a TCP client is
+    /// lazy (Ok even for a host that cannot resolve), a unix client eagerly checks
+    /// the path (Err for a missing socket), and an unrecognised value propagates the
+    /// classifier's error instead of falling back to the local socket.
+    #[test]
+    fn every_dispatch_arm_is_observable_without_a_daemon() {
+        assert!(
+            dispatch_docker_host(Some("tcp://nowhere.invalid:1")).is_ok(),
+            "a TCP transport must be handed to a lazy client, not rejected here"
+        );
+        assert!(
+            dispatch_docker_host(Some("unix:///nonexistent-cherino-test.sock")).is_err(),
+            "a unix transport must reach connect_with_socket, which eagerly checks the path"
+        );
+        let err = dispatch_docker_host(Some("fd://")).expect_err("unrecognised must propagate");
+        assert!(
+            format!("{err}").contains("tcp://"),
+            "the propagated error must name the recognised schemes: {err}"
+        );
+    }
+
+    #[test]
+    fn whitespace_and_mixed_case_hosts_are_normalised() {
+        match classify("  tcp://ProXy:2375  ") {
+            Ok(Some(DockerHostTransport::Http(v))) => assert_eq!(v, "tcp://ProXy:2375"),
+            other => panic!("expected a trimmed tcp transport, got {other:?}"),
+        }
+    }
+
     #[test]
     fn unix_sockets_are_honoured_case_insensitively() {
         for value in ["unix:///run/docker.sock", "UNIX:///run/docker.sock"] {
@@ -189,7 +229,11 @@ mod tests {
             let err = classify(value).expect_err(&format!("{value:?} must be rejected"));
             let text = format!("{err}");
             assert!(
-                text.contains("unix://") && text.contains("tcp://"),
+                text.contains("unix://")
+                    && text.contains("tcp://")
+                    && text.contains("http://")
+                    && text.contains("PLAINTEXT")
+                    && text.contains("unset"),
                 "the error must name the recognised schemes: {text}"
             );
         }

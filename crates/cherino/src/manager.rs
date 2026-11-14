@@ -274,6 +274,14 @@ impl super::ops::ContainerOps for ContainerManager {
         self.fork(params).await
     }
 
+    async fn fork_with_options(
+        &self,
+        params: &super::types::ContainerForkParams,
+        options: super::types::ForkOptions,
+    ) -> ContainerResult<ContainerInfo> {
+        ContainerManager::fork_with_options(self, params, options).await
+    }
+
     async fn commit(
         &self,
         container_id: &str,

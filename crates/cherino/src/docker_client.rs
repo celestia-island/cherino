@@ -193,6 +193,16 @@ mod tests {
     /// them would let two test threads race on the same variable. Mirrors the
     /// precedent in `lifecycle.rs` (`network_default_tests`): save, mutate under a
     /// SAFETY comment, assert, restore.
+    ///
+    /// Portability: the first half is cross-platform (`connect_with_socket` does its
+    /// own `exists()` check). The second half is `#[cfg(unix)]` only — on Windows
+    /// `connect_with_local_defaults()` routes to bollard's **named-pipe** defaults,
+    /// which build a client with no eager validation and therefore return `Ok`.
+    ///
+    /// Known limitation, recorded rather than engineered around: if an assertion
+    /// panics, the restore is skipped and `DOCKER_HOST` stays mutated for the rest of
+    /// the process. That can only cascade failures (never fake a pass), and a guard
+    /// type would not make the failure any clearer.
     #[test]
     fn connect_local_reads_the_environment() {
         let ambient = std::env::var("DOCKER_HOST").ok();
@@ -214,12 +224,16 @@ mod tests {
             // The `None` arm must reach bollard's local defaults, which themselves
             // honour a unix:// DOCKER_HOST and eagerly check the path — so a
             // `None => connect_http(..)` mutation (lazy, always Ok) is observable
-            // here as the absence of an error.
-            std::env::set_var("DOCKER_HOST", "unix:///nonexistent-cherino-local.sock");
-            assert!(
-                dispatch_docker_host(None).is_err(),
-                "None must reach connect_with_local_defaults, which honours unix:// and checks the path"
-            );
+            // here as the absence of an error. Unix only: Windows local defaults use
+            // named pipes, which validate nothing eagerly.
+            #[cfg(unix)]
+            {
+                std::env::set_var("DOCKER_HOST", "unix:///nonexistent-cherino-local.sock");
+                assert!(
+                    dispatch_docker_host(None).is_err(),
+                    "None must reach connect_with_local_defaults, which honours unix:// and checks the path"
+                );
+            }
         }
         match ambient {
             Some(value) => unsafe { std::env::set_var("DOCKER_HOST", value) },

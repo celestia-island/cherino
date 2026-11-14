@@ -1297,7 +1297,6 @@ mod tests {
         assert_eq!(labels.get("k").map(String::as_str), Some("override"));
     }
 
-    #[test]
     /// A *modified* ancestor can carry a mode/owner change a commit would keep, so
     /// only an added ancestor is scaffolding.
     #[test]
@@ -1341,6 +1340,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn split_repo_tag_handles_bare_and_tagged_refs() {
         assert_eq!(
             split_repo_tag("cosmos-fork-0190"),

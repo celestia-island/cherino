@@ -311,6 +311,60 @@ mod tests {
     /// product name, and `Ok(None)` is how it says so — never a
     /// placeholder version, never an error a consumer would log as a probe
     /// failure.
+    fn null_fork_params() -> ContainerForkParams {
+        ContainerForkParams {
+            source_container_id: "src".to_string(),
+            new_name: "fork".to_string(),
+            network: None,
+            volumes: Vec::new(),
+            env: HashMap::new(),
+            labels: HashMap::new(),
+            commit_labels: None,
+            image_tag: None,
+            user: None,
+            memory_limit: None,
+            nano_cpus: None,
+            pids_limit: None,
+            cap_drop: None,
+            cap_add: None,
+            security_opt: None,
+            read_only_rootfs: None,
+        }
+    }
+
+    /// A backend that does not implement the clean-layer path must REFUSE the
+    /// switch, never silently take the commit path: `clean_layer: true` is an
+    /// explicit request, and a backend that cannot honour it has to say so.
+    #[tokio::test]
+    async fn fork_with_options_default_refuses_clean_layer() {
+        let err = NullBackend
+            .fork_with_options(&null_fork_params(), ForkOptions { clean_layer: true })
+            .await
+            .expect_err("a non-supporting backend must not accept clean_layer");
+        assert!(
+            matches!(err, ContainerError::OperationFailed { .. }),
+            "expected OperationFailed, got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("clean-layer"),
+            "the refusal must name the unsupported switch: {err}"
+        );
+    }
+
+    /// With the switch off, the default body must delegate to `fork` — i.e. a
+    /// backend that never opted in keeps its ordinary behaviour, not a new error.
+    #[tokio::test]
+    async fn fork_with_options_default_delegates_to_fork() {
+        let err = NullBackend
+            .fork_with_options(&null_fork_params(), ForkOptions::default())
+            .await
+            .expect_err("NullBackend::fork is UnsupportedBackend");
+        assert!(
+            matches!(&err, ContainerError::UnsupportedBackend(m) if m == "fork"),
+            "default options must reach the backend's own fork: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn version_defaults_to_none() {
         let version = NullBackend

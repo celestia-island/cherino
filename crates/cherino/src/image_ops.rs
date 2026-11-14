@@ -88,7 +88,10 @@ fn split_repo_tag(image_tag: &str) -> (String, String) {
     match image_tag.rsplit_once(':') {
         // A tag never contains '/', so `registry:5000/org/img` keeps its port in
         // the repository and resolves to `latest`.
-        Some((repo, tag)) if !repo.is_empty() && !tag.is_empty() && !tag.contains('/') => {
+        // A digest ref (`repo@sha256:...`) is not a tag either; leave it intact.
+        Some((repo, tag))
+            if !repo.is_empty() && !tag.is_empty() && !tag.contains('/') && !repo.contains('@') =>
+        {
             (repo.to_string(), tag.to_string())
         }
         _ => (image_tag.to_string(), "latest".to_string()),
@@ -540,19 +543,30 @@ mod tests {
         VolumeMount::rw("/host/path", dest)
     }
 
-    /// The live scepter sandbox shape: read-only rootfs, bind mounts under
-    /// /celestia, tmpfs /tmp, socket bind below it.
+    /// The live scepter sandbox shape: read-only rootfs, tmpfs scratch, and the
+    /// bind destinations scepter actually mounts (steps.rs re-adds /home,
+    /// /workspace and /workspace-base around the inherited source mounts), plus
+    /// the socket dir bind below tmpfs /tmp.
     fn scepter_shape() -> (Vec<FilesystemChange>, Vec<VolumeMount>) {
         let changes = vec![
+            // repo mounts inherited from the source (live buffer shape)
             change("/celestia"),
             change("/celestia/entelecheia"),
             change("/celestia/evernight"),
+            // workspace mounts scepter re-adds for the fork (steps.rs:664-729)
+            change("/workspace"),
+            change("/workspace-base"),
+            change("/home"),
+            // tmpfs scratch + the socket dir bind below it
             change("/tmp"),
             change("/tmp/entelecheia-unix-socket"),
         ];
         let volumes = vec![
             mount("/celestia/entelecheia"),
             mount("/celestia/evernight"),
+            mount("/workspace"),
+            mount("/workspace-base"),
+            mount("/home"),
             mount("/tmp/entelecheia-unix-socket"),
         ];
         (changes, volumes)
@@ -775,6 +789,9 @@ mod tests {
         // same clean read-only source, `fork()` (options default) has to mint a new
         // commit image instead of reusing the source image.
         let plain = ContainerForkParams {
+            // Distinct name: `create` rejects a duplicate container name with
+            // AlreadyExists, which would make this assertion unreachable.
+            new_name: format!("cherino-u1-fork-plain-{run}"),
             image_tag: Some(format!("{}{}", COSMOS_FORK_PREFIX, Uuid::now_v7())),
             ..params.clone()
         };

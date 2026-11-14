@@ -36,7 +36,8 @@ struct SourceForkFacts {
 ///
 /// 1. the source rootfs is read-only, so no write can have reached the layer;
 /// 2. every recorded change is runtime scaffolding — a bind-mount destination
-///    from `volumes`, a tmpfs mount root, or an ancestor directory of either;
+///    from `volumes`, a tmpfs mount root, or an ancestor directory of a bind
+///    destination (tmpfs roots are top-level, so they have no such ancestor);
 /// 3. the source image id resolved, so there is an image to fork from.
 ///
 /// Anything else (a real write, a writable rootfs, an unresolved image) returns
@@ -319,8 +320,11 @@ impl ContainerManager {
         match self.create(&create_params).await {
             Ok(info) => Ok(info),
             Err(e) => {
-                // Clean up the committed image to prevent disk space leaks.
-                let _ = self.remove_image(&image_tag, true).await;
+                // Clean up the image we minted to prevent disk space leaks. On the
+                // reuse path the fork tag is an alias of the *source* image, so it
+                // is untagged only (force=false): the daemon keeps the image record
+                // any container still needs.
+                let _ = self.remove_image(&image_tag, !reuse_source_image).await;
                 Err(ContainerError::OperationFailed {
                     container_id: params.source_container_id.clone(),
                     message: format!("fork image is ready ({image_tag}), but create failed: {e}"),
@@ -560,8 +564,6 @@ mod tests {
             !ForkOptions::default().clean_layer,
             "the clean-layer fast path must stay opt-in until L2 is field-validated"
         );
-        // `fork` must be exactly `fork_with_options` with the default options.
-        assert!(!ForkOptions::default().clean_layer);
     }
 
     #[test]
@@ -728,13 +730,13 @@ mod tests {
             }
         };
         let image = std::env::var("CHERINO_TEST_IMAGE").unwrap_or_else(|_| "alpine:3".to_string());
+        // Unique names: a rerun after a panicked cleanup must not hit AlreadyExists.
+        let run = Uuid::now_v7().to_string();
+        let source_name = format!("cherino-u1-source-{run}");
         let source = manager
             .create(&super::super::types::ContainerCreateParams {
                 read_only_rootfs: Some(true),
-                ..super::super::types::ContainerCreateParams::simple(
-                    "cherino-u1-source",
-                    image.clone(),
-                )
+                ..super::super::types::ContainerCreateParams::simple(source_name, image.clone())
             })
             .await
             .expect("create read-only source container");
@@ -742,7 +744,7 @@ mod tests {
         let tag = format!("{}{}", COSMOS_FORK_PREFIX, Uuid::now_v7());
         let params = ContainerForkParams {
             source_container_id: source.id.clone(),
-            new_name: "cherino-u1-fork".to_string(),
+            new_name: format!("cherino-u1-fork-{run}"),
             network: None,
             volumes: Vec::new(),
             env: std::collections::HashMap::new(),
@@ -762,11 +764,33 @@ mod tests {
             .fork_with_options(&params, ForkOptions { clean_layer: true })
             .await
             .expect("fork via fast path");
+        // `ContainerInfo::image` is the image *id* (digest), not the tag, so the
+        // fork must report the same image the source container came from.
         assert_eq!(
-            forked.image, tag,
-            "fork image must be the tagged source image"
+            forked.image, source.image,
+            "the fast path must start the fork from the source image"
         );
 
+        // M6 guard: the default entry point must NOT take the fast path. On the
+        // same clean read-only source, `fork()` (options default) has to mint a new
+        // commit image instead of reusing the source image.
+        let plain = ContainerForkParams {
+            image_tag: Some(format!("{}{}", COSMOS_FORK_PREFIX, Uuid::now_v7())),
+            ..params.clone()
+        };
+        let committed = manager.fork(&plain).await.expect("fork via commit path");
+        assert_ne!(
+            committed.image, source.image,
+            "the default fork must commit, not reuse the source image"
+        );
+
+        let _ = manager
+            .remove_with_image(
+                &committed.id,
+                plain.image_tag.as_deref().unwrap_or(""),
+                true,
+            )
+            .await;
         let _ = manager.remove_with_image(&forked.id, &tag, true).await;
         let _ = manager
             .remove_with_image(&source.id, "unused-image-name", true)

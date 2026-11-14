@@ -6,7 +6,7 @@ use super::{
     errors::{ContainerError, ContainerResult},
     types::{
         ContainerCreateParams, ContainerDetail, ContainerForkParams, ContainerInfo,
-        ContainerVersion, ExecOutput, ImageInfo, PathChange, WritableRootfs,
+        ContainerVersion, ExecOutput, ForkOptions, ImageInfo, PathChange, WritableRootfs,
     },
 };
 
@@ -39,6 +39,25 @@ pub trait ContainerOps: Send + Sync {
     // -- Fork / Commit --
 
     async fn fork(&self, params: &ContainerForkParams) -> ContainerResult<ContainerInfo>;
+
+    /// Fork with explicit opt-in switches.
+    ///
+    /// The default implementation refuses `clean_layer` loudly and otherwise
+    /// delegates to [`Self::fork`], so a backend that cannot honour the switch
+    /// never silently ignores it. Backends with a native fast path override this.
+    async fn fork_with_options(
+        &self,
+        params: &ContainerForkParams,
+        options: ForkOptions,
+    ) -> ContainerResult<ContainerInfo> {
+        if options.clean_layer {
+            return Err(ContainerError::OperationFailed {
+                container_id: params.source_container_id.clone(),
+                message: "clean-layer fork is not supported by this backend".to_string(),
+            });
+        }
+        self.fork(params).await
+    }
     async fn commit(
         &self,
         container_id: &str,

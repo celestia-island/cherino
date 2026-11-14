@@ -62,7 +62,22 @@ impl RootfsManager {
             || image.contains('\\')
             || image.contains('\0')
         {
-            "_rejected_image_name_".to_string()
+            // Injective per-input sink (review S2, 2026-11-15): one shared
+            // constant made every rejected name collide — a first rejected
+            // pull would short-circuit `is_dir()` for all the others and a
+            // interrupted unpack would block them forever. Hex-encoding the
+            // raw name gives each evil input its own directory and can never
+            // equal a legit `replace` output of a *different* image (the
+            // only fixed point would be an image literally named like
+            // another image's full hex encoding — absurd, and still
+            // cache-level even then).
+            format!(
+                "_rejected_{}",
+                image
+                    .bytes()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
         } else {
             image.replace(['/', ':', '@'], "_")
         };
@@ -805,11 +820,23 @@ mod path_validation_tests {
                 "image name {evil:?} must stay under the cache root, got {p:?}"
             );
         }
-        // The inert sink must not collide with any real cached image dir.
-        assert_eq!(
-            mgr.base_rootfs_path(".."),
-            root.join("_rejected_image_name_"),
-            "rejected names map to one inert directory"
+        // Review S2 pin: distinct rejected names get DISTINCT sink dirs
+        // (one shared constant let a first rejected pull short-circuit
+        // every other), and no rejected name shares a directory with a
+        // legit mapping.
+        let a = mgr.base_rootfs_path("..");
+        let b = mgr.base_rootfs_path("../x");
+        assert_ne!(a, b, "distinct evil names must not collide");
+        assert!(
+            !a.to_string_lossy().ends_with("_rejected_image_name_"),
+            "no shared-constant sink"
+        );
+        // S3c pin: the pre-fix code mapped "" to the cache root ITSELF —
+        // remove_image("") deleted the whole cache root. Never again.
+        assert_ne!(
+            mgr.base_rootfs_path(""),
+            root,
+            "empty name must not resolve to the cache root itself"
         );
     }
 

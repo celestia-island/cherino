@@ -99,8 +99,8 @@ pub fn scepter_readonly() -> ContainerSecurity {
 /// in-container FUSE rootfs probe needs re-allowed — see
 /// [`seccomp::SeccompProfileData::cosmos`]); AppArmor decides which mounts are
 /// permitted (`fstype=fuse.*`, `overlay`, …). seccomp cannot
-/// scope `mount(2)` because its `fstype`/target arguments are pointers, so
-/// shipping seccomp without the AppArmor profile would be unconfined mounting,
+/// scope `mount(2)` because its `fstype` and target are pointers, so shipping
+/// seccomp without the AppArmor profile would leave the syscall unscoped,
 /// and shipping AppArmor without seccomp (the state before this change) left
 /// `ptrace`/`bpf`/`kexec_load` reachable. [`verify_mount_mediation`] enforces
 /// the pairing on any caller-supplied list.
@@ -186,6 +186,13 @@ impl SecurityOptDrift {
 /// The cosmos filter admits `mount`, and seccomp cannot scope `mount(2)`'s
 /// target — so that half is only safe together with a named AppArmor profile.
 ///
+/// What that profile actually constrains is the **filesystem type**, not the
+/// mount target: `mount fstype=proc|sysfs|overlay|fuse.*` carry no `-> target`
+/// rule, so a workload may mount those types at a path of its choosing; only the
+/// `cgroup` mount and the remount family are target-scoped, and `umount` is
+/// unconditional. The claim below is therefore "which filesystems may be
+/// mounted", not "where".
+///
 /// Returns `Err(reason)` when a `security_opt` list pairs a seccomp profile that
 /// admits `mount` with no `apparmor=` entry, or with `apparmor=unconfined`.
 /// That combination is one call away (`build_security_opts(Some(Cosmos))` is
@@ -215,8 +222,10 @@ pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
             ));
         }
     }
-    // A named AppArmor profile is the thing that scopes `mount(2)`'s target, so
-    // its presence is sufficient and its absence is what must be disproved.
+    // A named AppArmor profile is the thing that puts `mount(2)` under an LSM —
+    // it scopes the *filesystem type* (and the remount targets), not every mount
+    // target — so its presence is sufficient and its absence is what must be
+    // disproved.
     let named_apparmor = requested
         .iter()
         .find(|opt| security_opt_key(opt) == "apparmor")
@@ -1006,7 +1015,7 @@ mod tests {
         ];
         ensure!(
             verify_mount_mediation(&opts).is_ok(),
-            "a named AppArmor profile is what scopes mount(2)"
+            "a named AppArmor profile is what puts mount(2) under an LSM"
         );
         Ok(())
     }

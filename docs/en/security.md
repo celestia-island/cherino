@@ -29,7 +29,10 @@ the container config. Seccomp filtering is the first line of defence: it
 constrains which syscalls a sandboxed workload may make at all.
 
 Three profiles cover the preset families: `EntelecheiaDefault` (a plain
-workload: no `mount`), `Compile` (the default minus `userfaultfd`) and `Cosmos`
+workload: no `mount`), `Compile` (the default with `userfaultfd` removed from the explicit deny rule — a
+redundant entry, since the denying default action already refuses it: the profile
+exists for intent and for a filter compiled without that rule, not because it
+changes behaviour today) and `Cosmos`
 (the default **plus** `mount` and `umount2`, which the in-container
 `fuse-overlayfs` rootfs probe needs; `ptrace`, `bpf`, `kexec_load`, module
 loading and the keyring calls stay denied).
@@ -49,6 +52,19 @@ AppArmor's (below), so a profile that admits `mount` is only safe together with
 the named profile — `security_profile::cosmos_security_opts` emits both, and
 `ContainerManager::create` asserts at startup that the container really carries
 both (`verify_effective_security_opts`).
+
+What the shipped `celestia-cherino-fuse` profile actually constrains is the
+**filesystem type**: `mount fstype=proc`, `sysfs`, `overlay`, `fuse.*` and
+`devpts` carry no `-> target` rule, so a workload may mount those types at a path
+of its choosing; only the `cgroup` mount and the remount family are target-scoped,
+and `umount` is unconditional. The guarantee is "which filesystems may be
+mounted", not "where".
+
+Refusals are loud and immediate: a denied syscall returns `EPERM` to the caller
+(the filter's default action is `SCMP_ACT_ERRNO`), so there is no "quietly
+degraded" mode to debug. The one non-obvious consequence is the inner-OCI case
+described above — `libcontainer`'s first fd-based mount fails with `EPERM` and the
+runtime returns a clean error rather than hanging.
 
 ## AppArmor
 

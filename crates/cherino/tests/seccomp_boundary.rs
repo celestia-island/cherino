@@ -403,7 +403,8 @@ async fn container_create_keeps_the_cosmos_profile_and_passes_the_self_check() {
 }
 
 /// The half of the design that cannot be tested with `seccomp=` alone: AppArmor
-/// is what scopes the mount **target**, and a host that runs with the LSM off
+/// is what scopes the mounted **filesystem type** (the plain `fstype=` grants
+/// carry no target rule, so the target is unconstrained), and a host with the LSM off
 /// would let this profile mount anything.
 ///
 /// Two assertions on the same container, with `seccomp=unconfined` so only the
@@ -413,10 +414,10 @@ async fn container_create_keeps_the_cosmos_profile_and_passes_the_self_check() {
 ///  - a real `fuse-overlayfs` rootfs **works** — `fstype=fuse.*` is.
 ///
 /// Together they are the measurement the whole pairing rests on: seccomp grants
-/// the syscall, AppArmor decides the target.
+/// the syscall, AppArmor decides the filesystem type.
 #[test]
 #[ignore = "requires docker, /dev/fuse, a host with celestia-cherino-fuse loaded, CHERINO_SECCOMP_TEST_FUSE_IMAGE"]
-fn named_apparmor_profile_scopes_the_mount_target() {
+fn named_apparmor_profile_scopes_the_mounted_filesystem_type() {
     let Some(probe_image) = image() else {
         panic!("set CHERINO_SECCOMP_TEST_IMAGE to an image with `gcc` and `sh`");
     };
@@ -504,7 +505,8 @@ async fn create_refuses_a_mispaired_security_list_without_starting_a_container()
     // The capability that makes mount reachable in the first place: without it
     // the guard rightly lets the list through (see the postgres-shaped test).
     params.cap_add = Some(vec!["SYS_ADMIN".to_string()]);
-    // seccomp admits mount, AppArmor is unconfined: nothing scopes the target.
+    // seccomp admits mount, AppArmor is unconfined: nothing constrains the
+    // filesystem type or the target.
     params.security_opt = Some({
         let mut opts = vec![
             format!(

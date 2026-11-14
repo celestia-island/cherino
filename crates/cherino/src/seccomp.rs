@@ -477,12 +477,22 @@ impl SeccompProfileData {
     /// syscalls the in-container FUSE rootfs probe needs
     /// ([`COSMOS_FUSE_PROBE_SYSCALLS`]).
     ///
-    /// **One caller justifies this list**: `cherino-runtime`'s
-    /// `detect_rootfs_capability` spawns `fuse-overlayfs -o
+    /// **The documented reason for this list** is `cherino-runtime`'s rootfs
+    /// capability probe: `detect_rootfs_capability` spawns `fuse-overlayfs -o
     /// lowerdir=…,upperdir=…,workdir=… MERGED` (and `mount -t overlay overlay …`
     /// as the kernel-overlay fallback). `fuse-overlayfs` runs as root in the
     /// container, so libfuse issues classic `mount(2)` itself — the setuid
     /// `fusermount3` path is inert under `no-new-privileges`.
+    ///
+    /// Be precise about the deployed shape, though: that probe is **exported but
+    /// never called** in cherino, `cherino-runtime`, plana or entelecheia, and a
+    /// cosmos container is created with `devices: Vec::new()` — `/dev/fuse` is not
+    /// passed to it, so the FUSE branch could not run there even if something
+    /// called it. In the shape that ships, nothing inside cherino consumes
+    /// `mount`/`umount2`; they are available to the agent's own tool use, which is
+    /// the honest justification for granting the syscall at all. Dropping them is
+    /// a tightening that needs live re-verification of whatever the agent
+    /// workload actually calls — deliberately not done here.
     ///
     /// **Not justified, and therefore not here: the inner OCI runtime.** The
     /// Layer-5 sandbox (`libcontainer 0.7`, the crate `cherino-runtime` links)

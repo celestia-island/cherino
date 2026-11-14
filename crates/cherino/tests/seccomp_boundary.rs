@@ -161,6 +161,8 @@ fn parse_probe(stdout: &str) -> BTreeMap<String, i32> {
         "ptrace",
         "bpf",
         "process_vm_readv",
+        "fsopen",
+        "open_tree",
     ] {
         assert!(
             seen.contains_key(required),
@@ -190,6 +192,14 @@ fn cosmos_seccomp_boundary_matrix() {
     assert_eq!(
         unrestricted["bpf"], EINVAL,
         "baseline bpf reaches the kernel and is rejected on its arguments"
+    );
+    assert_eq!(
+        unrestricted["fsopen"], 0,
+        "baseline: the new mount API is reachable (and not AppArmor-mediated): {unrestricted:?}"
+    );
+    assert_eq!(
+        unrestricted["open_tree"], 0,
+        "baseline: open_tree is reachable: {unrestricted:?}"
     );
 
     // The workload default — the filter that was too strict for cosmos. This is
@@ -229,6 +239,17 @@ fn cosmos_seccomp_boundary_matrix() {
     assert_eq!(
         cosmos["process_vm_readv"], EPERM,
         "cosmos must still refuse process_vm_readv"
+    );
+    // The new mount API must stay refused: AppArmor does not mediate it, so
+    // admitting it would hand the workload the mount authority the profile
+    // denies on the classic path.
+    assert_eq!(
+        cosmos["fsopen"], EPERM,
+        "cosmos must refuse the new mount API (no AppArmor mediation): {cosmos:?}"
+    );
+    assert_eq!(
+        cosmos["open_tree"], EPERM,
+        "cosmos must refuse open_tree (clone + move_mount bypasses AppArmor): {cosmos:?}"
     );
 
     println!("unconfined: {unrestricted:?}");

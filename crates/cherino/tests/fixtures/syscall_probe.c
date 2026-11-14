@@ -15,11 +15,18 @@
  *   ptrace(TRACEME)   succeeds on an untraced process, EPERM under a filter
  *   bpf(0,0,0)        EINVAL (22) with a bad command, EPERM under a filter
  *   process_vm_readv  EINVAL (22) with zero lengths, EPERM under a filter
+ *   fsopen            a mount-context fd for "tmpfs" when the new mount API is
+ *                     reachable, EPERM under a filter (AppArmor does not mediate
+ *                     the new API on kernel 6.1, so it must stay denied)
+ *   open_tree         a cloned mount fd for "/" when reachable, EPERM under a
+ *                     filter (same reason: clone + move_mount would mount
+ *                     anything AppArmor's classic rules refuse)
  *
  * Build: gcc -O1 -Wall -o probe syscall_probe.c
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +68,23 @@ static long p_ptrace(void) { return ptrace(PTRACE_TRACEME, 0, 0, 0); }
 
 static long p_bpf(void) { return syscall(SYS_bpf, 0, 0, 0); }
 
+#ifndef SYS_fsopen
+#define SYS_fsopen 430
+#endif
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+#define OPEN_TREE_CLONE 1
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+
+static long p_fsopen(void) { return syscall(SYS_fsopen, "tmpfs", 0); }
+
+static long p_open_tree(void) {
+    return syscall(SYS_open_tree, AT_FDCWD, "/", OPEN_TREE_CLONE | AT_RECURSIVE);
+}
+
 static long p_process_vm_readv(void) {
     struct iovec local = {0};
     struct iovec remote = {0};
@@ -78,5 +102,9 @@ int main(void) {
     probe("ptrace", p_ptrace);
     probe("bpf", p_bpf);
     probe("process_vm_readv", p_process_vm_readv);
+    /* The new mount API is the AppArmor bypass this profile must not open:
+     * neither syscall is AppArmor-mediated on kernel 6.1. */
+    probe("fsopen", p_fsopen);
+    probe("open_tree", p_open_tree);
     return 0;
 }

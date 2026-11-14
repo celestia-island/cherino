@@ -496,6 +496,12 @@ impl SeccompProfileData {
     /// `mount(2)`'s `fstype` and target are pointers, so a syscall filter cannot
     /// scope them; the AppArmor profile `celestia-cherino-fuse` does
     /// (`mount fstype=fuse.*`, `overlay`, `proc`, `sysfs`, `cgroup`).
+    ///
+    /// The new mount API is **not** in the family, on purpose: AppArmor does not
+    /// mediate it on kernel 6.1 (measured — see
+    /// [`COSMOS_FUSE_OCI_SYSCALLS`]), so admitting `fsopen`/`move_mount`/
+    /// `open_tree` would be a mount-authority bypass of the very profile this
+    /// filter is paired with.
     pub fn cosmos() -> Self {
         let mut profile = Self::entelecheia_default();
         for rule in &mut profile.syscalls {
@@ -522,19 +528,25 @@ impl SeccompProfileData {
 /// The syscalls the in-container FUSE rootfs probe and the in-container OCI
 /// runtime (Layer 5) need, and that a plain workload does not.
 ///
-/// Every name here is re-allowed for cosmos containers **only**, and every one
-/// of them is a mount or namespace operation, whose target AppArmor still
-/// mediates (see [`SeccompProfileData::cosmos`]).
-pub const COSMOS_FUSE_OCI_SYSCALLS: [&str; 14] = [
+/// Every name here is re-allowed for cosmos containers **only**, and every
+/// mount-capable one is mediated by AppArmor on the classic path (measured:
+/// `mount(2)` of `tmpfs` under `celestia-cherino-fuse` returns `EACCES`, while
+/// `fstype=fuse.*`/`overlay` succeed — see [`SeccompProfileData::cosmos`]).
+///
+/// **The new mount API is deliberately absent**: `fsopen`, `fsconfig`,
+/// `fsmount`, `move_mount`, `open_tree` and `mount_setattr` are not AppArmor-
+/// mediated on kernel 6.1 (measured 2026-11-15: classic `mount(2)` of tmpfs is
+/// refused with EACCES under the installed profile while
+/// `fsopen`→`fsconfig(CREATE)`→`fsmount`→`move_mount` of the same tmpfs
+/// succeeds and appears in `/proc/mounts`, and `open_tree(OPEN_TREE_CLONE)` of
+/// `/etc` succeeds). Admitting them would hand a workload exactly the mount
+/// capability the profile exists to deny, so they stay on the deny-by-default
+/// floor until the host LSM covers them. Neither caller needs them: the FUSE
+/// probe and libcontainer both use classic `mount(2)`.
+pub const COSMOS_FUSE_OCI_SYSCALLS: [&str; 8] = [
     "chroot",
     "close_range",
-    "fsconfig",
-    "fsmount",
-    "fsopen",
     "mount",
-    "mount_setattr",
-    "move_mount",
-    "open_tree",
     "pivot_root",
     "sethostname",
     "setns",
@@ -768,6 +780,14 @@ mod tests {
             "reboot",
             "swapon",
             "swapoff",
+            // The new mount API: not AppArmor-mediated on kernel 6.1, so it must
+            // stay on the deny-by-default floor even though it is a "mount".
+            "fsopen",
+            "fsconfig",
+            "fsmount",
+            "move_mount",
+            "open_tree",
+            "mount_setattr",
         ] {
             ensure!(
                 !allow.names.iter().any(|n| n == name),

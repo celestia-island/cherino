@@ -1323,9 +1323,12 @@ mod tests {
         let source = manager
             .create(&super::super::types::ContainerCreateParams {
                 read_only_rootfs: Some(true),
-                // Set only on the container (the image has none): the tag path must
-                // carry these into the fork's create params, the commit path bakes
-                // them into the image, so both forks must end up with them.
+                // Set only on the container (the image has none) so the source
+                // exercises the config-carrying path. This test asserts image
+                // identity only: the carried values themselves are pinned by the
+                // `merged_env_and_labels_prefer_the_caller` and
+                // `non_representable_config_detects_a_divergence` unit tests,
+                // because `ContainerInfo` exposes neither field.
                 working_dir: Some("/home".to_string()),
                 healthcheck: Some(super::super::types::HealthcheckParams {
                     test: vec!["CMD".to_string(), "true".to_string()],

@@ -130,10 +130,6 @@ fn merge_security_opts(primary: Vec<String>, secondary: Vec<String>) -> Vec<Stri
     merged
 }
 
-/// `security_opt` keys the runtime merges instead of replacing, so repeating
-/// them is well-defined and must not be treated as ambiguity.
-pub const ADDITIVE_SECURITY_OPT_KEYS: [&str; 1] = ["label"];
-
 /// The key of one Docker `security_opt` entry: the text before the first `=` or
 /// `:` (`seccomp={...}`, `apparmor=…`, `no-new-privileges:true`).
 pub fn security_opt_key(opt: &str) -> &str {
@@ -199,14 +195,15 @@ impl SecurityOptDrift {
 /// `compile` presets) are fine on their own.
 pub fn verify_mount_mediation(requested: &[String]) -> Result<(), String> {
     // Duplicated keys make a list ambiguous — which entry a runtime applies is
-    // not defined — so nothing about it is provable. Only keys whose entries
-    // *replace* one another are affected: `label=` is additive (the runtime
-    // merges every occurrence), so duplicates there are legitimate and are not
-    // this guard's business.
+    // not defined — so nothing about it is provable. This is uniform: every key
+    // is subject to it, including additive ones like `label=`. A key that the
+    // runtime merges could legitimately repeat, but the drift check downstream
+    // compares single values, so admitting repeats here would only move the
+    // contradiction one step later (an admitted list that is then force-removed
+    // as "drift"). If an additive-key case is ever needed, the guard **and** the
+    // drift comparison have to learn multiset semantics together; until then,
+    // duplicates are refused and `label=` appears at most once.
     for key in requested.iter().map(|opt| security_opt_key(opt)) {
-        if ADDITIVE_SECURITY_OPT_KEYS.contains(&key) {
-            continue;
-        }
         if requested
             .iter()
             .filter(|opt| security_opt_key(opt) == key)

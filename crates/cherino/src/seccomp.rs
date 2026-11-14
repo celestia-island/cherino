@@ -698,13 +698,14 @@ mod tests {
     fn unshare_not_allow_or_deny_listed() -> Result<()> {
         // `unshare` is an escape vector: it appears in NEITHER the allow-list NOR
         // the explicit deny-list, relying on the deny-by-default action
-        // (SCMP_ACT_ERRNO) to block it. This holds for all three presets now —
-        // the cosmos preset briefly allowed the namespace family while it was
-        // scoped to the inner OCI runtime, and that half was retracted (see
-        // `SeccompProfileData::cosmos`).
+        // (SCMP_ACT_ERRNO) to block it. Asserted for every preset — Cosmos used
+        // to allow the namespace family while it was scoped to the inner OCI
+        // runtime, and that half was retracted (see `SeccompProfileData::cosmos`),
+        // so the loop covers all three to keep it that way.
         for profile in [
             SeccompProfile::EntelecheiaDefault.to_profile_data(),
             SeccompProfile::Compile.to_profile_data(),
+            SeccompProfile::Cosmos.to_profile_data(),
         ] {
             let allow_rule = profile
                 .syscalls

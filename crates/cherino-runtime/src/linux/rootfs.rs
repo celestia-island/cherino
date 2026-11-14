@@ -743,6 +743,16 @@ impl RootfsManager {
         // Symlink table: CANONICAL path -> raw target components. Canonical
         // because a symlink may itself live behind another symlink (`/bin`
         // behind `/bin -> usr/bin`); we register the resolved location.
+        //
+        // KNOWN LIMITATION (review S3, non-exploitable): the table only
+        // knows links that appeared EARLIER in the archive. A child link
+        // registered before its prefix link (`b/c -> X` then `b -> d`)
+        // keeps its pre-prefix canonical spot, so a member written through
+        // the later shape can slip past the resolver. GNU tar itself
+        // refuses that extraction ("Cannot create symlink ... File
+        // exists", exit 2) — verified with a crafted archive — so the
+        // write never lands; the resolver is the second line, not the
+        // only one.
         let mut links: std::collections::HashMap<Vec<String>, (Vec<String>, bool)> =
             std::collections::HashMap::new();
 

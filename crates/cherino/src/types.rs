@@ -238,6 +238,27 @@ pub struct ContainerForkParams {
     pub read_only_rootfs: Option<bool>,
 }
 
+/// Opt-in switches for [`ContainerManager::fork_with_options`].
+///
+/// Deliberately a separate struct instead of new fields on
+/// [`ContainerForkParams`]: every consumer in the org builds that struct with an
+/// exhaustive literal (scepter `skill_chain/execution/steps.rs`, neikos
+/// `container_fork.rs`, fuuka `executor/pool.rs`), so adding a field there
+/// breaks all of them at the next dependency pickup, including consumers this
+/// PR is not allowed to touch.
+#[derive(Debug, Clone, Default)]
+pub struct ForkOptions {
+    /// Skip the redundant `docker commit` when the source container's writable
+    /// layer provably holds no state: read-only source rootfs, a filesystem diff
+    /// made only of bind/tmpfs mount scaffolding, and a resolvable source image.
+    /// The fork then starts from the source image (tagged as the fork image),
+    /// which is filesystem-identical and avoids ~0.95 s of daemon commit work.
+    ///
+    /// Default `false` — opt-in until the L2 path is field-validated. See
+    /// [`crate::image_ops::fork_can_reuse_source_image`].
+    pub clean_layer: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, cherino_macros::Getters)]
 pub struct ContainerDetail {
     #[serde(flatten)]

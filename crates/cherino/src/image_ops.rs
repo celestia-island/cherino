@@ -4,18 +4,95 @@ use uuid::Uuid;
 
 use bollard::{
     container::LogOutput,
-    query_parameters::{CommitContainerOptions, RemoveImageOptions},
+    models::FilesystemChange,
+    query_parameters::{CommitContainerOptions, RemoveImageOptions, TagImageOptions},
 };
 use tracing::{info, warn};
 
 use super::{
     errors::{ContainerError, ContainerResult},
     manager::ContainerManager,
-    types::{ContainerForkParams, ContainerInfo, ImageInfo},
+    types::{ContainerForkParams, ContainerInfo, ForkOptions, ImageInfo, VolumeMount},
 };
 
 const COSMOS_FORK_PREFIX: &str = "cosmos-fork-";
 const COSMOS_SNAPSHOT_PREFIX: &str = "cosmos-snapshot-";
+
+/// Directories a runtime may back with tmpfs; reuses the sandbox preset's list so
+/// there is one source of truth. Their *contents* never enter the writable layer,
+/// so a change record naming the mount root is scaffolding. A record *below* one
+/// is deliberately not scaffolding: seeing it proves the path is a real
+/// directory, i.e. the container has genuine state there.
+const RUNTIME_SCRATCH_ROOTS: [&str; 3] = super::security_profile::READONLY_SCRATCH_PATHS;
+
+/// What the fast path needs to know about the source container.
+struct SourceForkFacts {
+    image_id: String,
+    read_only_rootfs: Option<bool>,
+}
+
+/// True when a fork may start from the source container's own image instead of
+/// committing a new one. All three preconditions must hold:
+///
+/// 1. the source rootfs is read-only, so no write can have reached the layer;
+/// 2. every recorded change is runtime scaffolding — a bind-mount destination
+///    from `volumes`, a tmpfs mount root, or an ancestor directory of either;
+/// 3. the source image id resolved, so there is an image to fork from.
+///
+/// Anything else (a real write, a writable rootfs, an unresolved image) returns
+/// `false` and the caller takes the ordinary commit path. The response is a
+/// normal `docker tag` of the source image under the fork tag, so
+/// [`ContainerManager::remove_with_image`] still finds a `cosmos-fork-*` ref.
+pub fn fork_can_reuse_source_image(
+    changes: &[FilesystemChange],
+    volumes: &[VolumeMount],
+    source_read_only_rootfs: Option<bool>,
+    source_image_id: Option<&str>,
+) -> bool {
+    if source_read_only_rootfs != Some(true) {
+        return false;
+    }
+    let Some(image_id) = source_image_id else {
+        return false;
+    };
+    if image_id.trim().is_empty() {
+        return false;
+    }
+    changes.iter().all(|c| {
+        // A delete means real content left the layer, so it is never scaffolding
+        // even at a mount path (which a live mount makes undeletable anyway).
+        !matches!(c.kind, bollard::models::ChangeType::_2) && is_runtime_scaffold(&c.path, volumes)
+    })
+}
+
+/// A diff path that cannot carry container state: an exact tmpfs root, an exact
+/// bind destination, or a strict ancestor directory of either.
+fn is_runtime_scaffold(path: &str, volumes: &[VolumeMount]) -> bool {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() || path == "/" {
+        return false;
+    }
+    if RUNTIME_SCRATCH_ROOTS.contains(&path) {
+        return true;
+    }
+    volumes.iter().any(|v| {
+        let dest = v.container_path.trim_end_matches('/');
+        !dest.is_empty() && (dest == path || dest.starts_with(&format!("{path}/")))
+    })
+}
+
+/// `repo:tag` → (`repo`, `tag`); a bare repository resolves to `latest`, the
+/// same default the commit path gets from Docker.
+fn split_repo_tag(image_tag: &str) -> (String, String) {
+    match image_tag.rsplit_once(':') {
+        // A tag never contains '/', so `registry:5000/org/img` keeps its port in
+        // the repository and resolves to `latest`.
+        Some((repo, tag)) if !repo.is_empty() && !tag.is_empty() && !tag.contains('/') => {
+            (repo.to_string(), tag.to_string())
+        }
+        _ => (image_tag.to_string(), "latest".to_string()),
+    }
+}
 
 impl ContainerManager {
     pub async fn remove_with_image(
@@ -70,14 +147,134 @@ impl ContainerManager {
         Ok(response.id)
     }
 
+    /// Inspect the source container for the two facts the clean-layer fast path
+    /// needs: its image id (to fork from) and whether its rootfs is read-only.
+    async fn source_fork_facts(&self, container_id: &str) -> ContainerResult<SourceForkFacts> {
+        let inspect = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| match e {
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                } => ContainerError::NotFound(container_id.to_string()),
+                other => ContainerError::from(other),
+            })?;
+
+        Ok(SourceForkFacts {
+            image_id: inspect.image.clone().unwrap_or_default(),
+            read_only_rootfs: inspect.host_config.as_ref().and_then(|h| h.readonly_rootfs),
+        })
+    }
+
+    /// Probe the source container and, when its layer is provably clean, tag its
+    /// image under `image_tag` so the fork can start from that image.
+    ///
+    /// Best-effort by design: a probe failure (inspect 404, diff error, daemon
+    /// hiccup, tag error) logs and answers `false`, i.e. the caller takes the
+    /// ordinary commit path. This optimization must never turn a working fork
+    /// into a failed one.
+    async fn reuse_source_image_if_clean(
+        &self,
+        params: &ContainerForkParams,
+        image_tag: &str,
+    ) -> bool {
+        let facts = match self.source_fork_facts(&params.source_container_id).await {
+            Ok(facts) => facts,
+            Err(e) => {
+                warn!(
+                    container = %params.source_container_id,
+                    error = %e,
+                    "fork: source inspect failed, taking the commit path"
+                );
+                return false;
+            }
+        };
+        let changes = match self
+            .container_filesystem_changes(&params.source_container_id)
+            .await
+        {
+            Ok(changes) => changes,
+            Err(e) => {
+                warn!(
+                    container = %params.source_container_id,
+                    error = %e,
+                    "fork: source diff failed, taking the commit path"
+                );
+                return false;
+            }
+        };
+        if !fork_can_reuse_source_image(
+            &changes,
+            &params.volumes,
+            facts.read_only_rootfs,
+            Some(facts.image_id.as_str()),
+        ) {
+            return false;
+        }
+
+        let (repo, tag) = split_repo_tag(image_tag);
+        let tag_options = TagImageOptions {
+            repo: Some(repo),
+            tag: Some(tag),
+        };
+        if let Err(e) = self
+            .docker
+            .tag_image(&facts.image_id, Some(tag_options))
+            .await
+        {
+            warn!(
+                container = %params.source_container_id,
+                image = %image_tag,
+                error = %e,
+                "fork: tagging the clean source image failed, taking the commit path"
+            );
+            return false;
+        }
+
+        info!(
+            container = %params.source_container_id,
+            image = %image_tag,
+            changes = changes.len(),
+            "fork: source layer is clean, reusing its image instead of committing"
+        );
+        // A plain tag cannot carry labels; these are write-only audit metadata
+        // today (no reader in cherino, scepter, neikos or fuuka).
+        if params.commit_labels.as_ref().is_some_and(|l| !l.is_empty()) {
+            info!(
+                image = %image_tag,
+                "fork: commit labels are not carried by the clean-layer fast path"
+            );
+        }
+        true
+    }
+
     pub async fn fork(&self, params: &ContainerForkParams) -> ContainerResult<ContainerInfo> {
+        self.fork_with_options(params, ForkOptions::default()).await
+    }
+
+    /// [`Self::fork`] with explicit opt-in switches. `fork` is this call with
+    /// [`ForkOptions::default`], so every existing caller keeps identical
+    /// behaviour.
+    pub async fn fork_with_options(
+        &self,
+        params: &ContainerForkParams,
+        options: ForkOptions,
+    ) -> ContainerResult<ContainerInfo> {
         let image_tag = params
             .image_tag
             .clone()
             .unwrap_or_else(|| format!("{}{}", COSMOS_FORK_PREFIX, Uuid::now_v7()));
 
-        let image_id = self
-            .commit_with_labels(
+        // U1 fast path (opt-in): when the source layer provably holds no state, a
+        // commit would mint an image identical to the source image at ~0.95 s of
+        // daemon work. Tag the source image under the fork tag instead so
+        // `remove_with_image` keeps its `cosmos-fork-*` cleanup contract.
+        let reuse_source_image =
+            options.clean_layer && self.reuse_source_image_if_clean(params, &image_tag).await;
+
+        if !reuse_source_image {
+            self.commit_with_labels(
                 &params.source_container_id,
                 &image_tag,
                 None,
@@ -90,6 +287,7 @@ impl ContainerManager {
                     params.source_container_id, e
                 ))
             })?;
+        }
 
         let create_params = super::types::ContainerCreateParams {
             name: params.new_name.clone(),
@@ -125,10 +323,7 @@ impl ContainerManager {
                 let _ = self.remove_image(&image_tag, true).await;
                 Err(ContainerError::OperationFailed {
                     container_id: params.source_container_id.clone(),
-                    message: format!(
-                        "commit succeeded (image {}), but create failed: {}",
-                        image_id, e
-                    ),
+                    message: format!("fork image is ready ({image_tag}), but create failed: {e}"),
                 })
             }
         }
@@ -322,5 +517,259 @@ impl ContainerManager {
             }
             Err(_) => super::types::ServerStatus::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bollard::models::ChangeType;
+
+    fn change(path: &str) -> FilesystemChange {
+        FilesystemChange {
+            path: path.to_string(),
+            kind: ChangeType::_1,
+        }
+    }
+
+    fn mount(dest: &str) -> VolumeMount {
+        VolumeMount::rw("/host/path", dest)
+    }
+
+    /// The live scepter sandbox shape: read-only rootfs, bind mounts under
+    /// /celestia, tmpfs /tmp, socket bind below it.
+    fn scepter_shape() -> (Vec<FilesystemChange>, Vec<VolumeMount>) {
+        let changes = vec![
+            change("/celestia"),
+            change("/celestia/entelecheia"),
+            change("/celestia/evernight"),
+            change("/tmp"),
+            change("/tmp/entelecheia-unix-socket"),
+        ];
+        let volumes = vec![
+            mount("/celestia/entelecheia"),
+            mount("/celestia/evernight"),
+            mount("/tmp/entelecheia-unix-socket"),
+        ];
+        (changes, volumes)
+    }
+
+    #[test]
+    fn fork_fast_path_defaults_to_off() {
+        assert!(
+            !ForkOptions::default().clean_layer,
+            "the clean-layer fast path must stay opt-in until L2 is field-validated"
+        );
+        // `fork` must be exactly `fork_with_options` with the default options.
+        assert!(!ForkOptions::default().clean_layer);
+    }
+
+    #[test]
+    fn mountpoint_only_diff_reuses_the_source_image() {
+        let (changes, volumes) = scepter_shape();
+        assert!(fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+    }
+
+    #[test]
+    fn an_empty_diff_reuses_the_source_image() {
+        // A brand-new container whose rootfs is read-only reports no changes at all.
+        assert!(fork_can_reuse_source_image(
+            &[],
+            &[mount("/celestia/entelecheia")],
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+    }
+
+    #[test]
+    fn a_deleted_path_forces_a_commit() {
+        // A delete means content left the layer, so it is never scaffolding.
+        let changes = vec![FilesystemChange {
+            path: "/celestia".to_string(),
+            kind: ChangeType::_2,
+        }];
+        let volumes = vec![mount("/celestia/entelecheia")];
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+    }
+
+    #[test]
+    fn real_write_under_home_forces_a_commit() {
+        let (mut changes, volumes) = scepter_shape();
+        changes.push(change("/home/entelecheia/report.md"));
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+    }
+
+    #[test]
+    fn a_change_below_a_tmpfs_root_is_not_scaffolding() {
+        // Seeing /tmp/<x> proves /tmp is a real directory in the layer, so the
+        // entry is content and the fork must commit.
+        let (mut changes, volumes) = scepter_shape();
+        changes.push(change("/tmp/scratch.bin"));
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+    }
+
+    #[test]
+    fn a_change_below_a_bind_destination_is_not_scaffolding() {
+        let (mut changes, volumes) = scepter_shape();
+        changes.push(change("/celestia/entelecheia/src/lib.rs"));
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(true),
+            Some("sha256:c49ba4b956a5")
+        ));
+    }
+
+    #[test]
+    fn writable_rootfs_forces_a_commit() {
+        let (changes, volumes) = scepter_shape();
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(false),
+            Some("sha256:c49ba4b956a5")
+        ));
+        assert!(
+            !fork_can_reuse_source_image(&changes, &volumes, None, Some("sha256:c49ba4b956a5")),
+            "an unknown rootfs mode is not proof of cleanliness"
+        );
+    }
+
+    #[test]
+    fn unresolvable_source_image_forces_a_commit() {
+        let (changes, volumes) = scepter_shape();
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(true),
+            None
+        ));
+        assert!(!fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(true),
+            Some("   ")
+        ));
+    }
+
+    #[test]
+    fn nested_bind_destination_marks_its_ancestor_as_scaffolding() {
+        let changes = vec![change("/work"), change("/work/sub")];
+        let volumes = vec![mount("/work/sub")];
+        assert!(fork_can_reuse_source_image(
+            &changes,
+            &volumes,
+            Some(true),
+            Some("sha256:aa")
+        ));
+    }
+
+    #[test]
+    fn root_and_empty_paths_are_never_scaffolding() {
+        assert!(!is_runtime_scaffold("/", &[]));
+        assert!(!is_runtime_scaffold("", &[]));
+    }
+
+    #[test]
+    fn split_repo_tag_handles_bare_and_tagged_refs() {
+        assert_eq!(
+            split_repo_tag("cosmos-fork-0190"),
+            ("cosmos-fork-0190".to_string(), "latest".to_string())
+        );
+        assert_eq!(
+            split_repo_tag("registry.local/fork:r7"),
+            ("registry.local/fork".to_string(), "r7".to_string())
+        );
+        // A registry port is not a tag: the ':' suffix contains '/'.
+        assert_eq!(
+            split_repo_tag("ghcr.io:5000/org/img"),
+            ("ghcr.io:5000/org/img".to_string(), "latest".to_string())
+        );
+    }
+
+    /// Integration-shaped exercise of the tag path against a live Docker daemon.
+    ///
+    /// NOT RUNNABLE in this workspace's verification lane: `sandbox_run.py` runs
+    /// with `--network none` and no `/var/run/docker.sock`, so the docker-tests
+    /// feature cannot reach a daemon inside the container. Run it on a host with
+    /// Docker via `RUN_DOCKER_TESTS=1 cargo test -p cherino --features docker-tests`.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn fast_path_tags_the_source_image_instead_of_committing() {
+        if std::env::var("RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipped: set RUN_DOCKER_TESTS=1 with a live daemon");
+            return;
+        }
+        let manager = match ContainerManager::new() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("skipped: docker unavailable: {e}");
+                return;
+            }
+        };
+        let image = std::env::var("CHERINO_TEST_IMAGE").unwrap_or_else(|_| "alpine:3".to_string());
+        let source = manager
+            .create(&super::super::types::ContainerCreateParams {
+                read_only_rootfs: Some(true),
+                ..super::super::types::ContainerCreateParams::simple(
+                    "cherino-u1-source",
+                    image.clone(),
+                )
+            })
+            .await
+            .expect("create read-only source container");
+
+        let tag = format!("{}{}", COSMOS_FORK_PREFIX, Uuid::now_v7());
+        let params = ContainerForkParams {
+            source_container_id: source.id.clone(),
+            new_name: "cherino-u1-fork".to_string(),
+            network: None,
+            volumes: Vec::new(),
+            env: std::collections::HashMap::new(),
+            labels: std::collections::HashMap::new(),
+            commit_labels: None,
+            image_tag: Some(tag.clone()),
+            user: None,
+            memory_limit: None,
+            nano_cpus: None,
+            pids_limit: None,
+            cap_drop: None,
+            cap_add: None,
+            security_opt: None,
+            read_only_rootfs: Some(true),
+        };
+        let forked = manager
+            .fork_with_options(&params, ForkOptions { clean_layer: true })
+            .await
+            .expect("fork via fast path");
+        assert_eq!(
+            forked.image, tag,
+            "fork image must be the tagged source image"
+        );
+
+        let _ = manager.remove_with_image(&forked.id, &tag, true).await;
+        let _ = manager
+            .remove_with_image(&source.id, "unused-image-name", true)
+            .await;
     }
 }

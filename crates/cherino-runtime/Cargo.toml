@@ -19,7 +19,7 @@ cherino = { path = "../cherino", version = "0.2", default-features = false }
 flate2 = "^1"
 tar = "^0.4"
 async-trait = "^0.1"
-chrono = { version = "^0.4", features = ["serde", "clock"] }
+jiff = "1"
 reqwest = { version = "^0.13", default-features = false, features = [
     "json",
     "rustls-no-provider",

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -134,7 +134,7 @@ pub struct ContainerInfo {
     pub image: String,
     pub status: ContainerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<Timestamp>,
     pub ports: Vec<PortMapping>,
     pub env: std::collections::HashMap<String, String>,
     pub volumes: Vec<VolumeMount>,

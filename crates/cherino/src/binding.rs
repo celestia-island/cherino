@@ -1,5 +1,5 @@
 use anyhow::{Context, Error, Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
@@ -92,7 +92,7 @@ pub struct ContainerBinding {
     pub container_uuid: Uuid,
     pub binding_id: BindingId,
     #[getter(skip)]
-    pub bound_at: DateTime<Utc>,
+    pub bound_at: Timestamp,
     pub metadata: serde_json::Value,
 }
 

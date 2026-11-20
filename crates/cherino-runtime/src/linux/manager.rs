@@ -1,4 +1,4 @@
-use chrono::Utc;
+use jiff::Timestamp;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -337,7 +337,7 @@ impl YoukiManager {
                     name: id.to_string(),
                     image: "test".to_string(),
                     status: ContainerStatus::Running,
-                    created_at: Some(Utc::now()),
+                    created_at: Some(Timestamp::now()),
                     ports: Vec::new(),
                     env: HashMap::new(),
                     volumes: Vec::new(),
@@ -348,7 +348,7 @@ impl YoukiManager {
                 rootfs_path,
                 pid: None,
                 exit_code: None,
-                started_at: Some(Utc::now().to_rfc3339()),
+                started_at: Some(Timestamp::now().to_string()),
                 finished_at: None,
                 error: None,
                 user: None,
@@ -405,7 +405,7 @@ impl YoukiManager {
             name: params.name.clone(),
             image: params.image.clone(),
             status,
-            created_at: Some(Utc::now()),
+            created_at: Some(Timestamp::now()),
             ports: params.ports.clone(),
             env: params.env.clone(),
             volumes: params.volumes.clone(),
@@ -749,7 +749,7 @@ impl ContainerOps for YoukiManager {
                 rootfs_path,
                 pid,
                 exit_code: None,
-                started_at: Some(Utc::now().to_rfc3339()),
+                started_at: Some(Timestamp::now().to_string()),
                 finished_at: None,
                 error: None,
                 user: params.user.clone(),
@@ -829,7 +829,12 @@ impl ContainerOps for YoukiManager {
             .update_status(&resolved_id, ContainerStatus::Exited)
             .await;
         self.state
-            .update_exit_status(&resolved_id, Some(0), Some(Utc::now().to_rfc3339()), None)
+            .update_exit_status(
+                &resolved_id,
+                Some(0),
+                Some(Timestamp::now().to_string()),
+                None,
+            )
             .await;
         if let Some(old) = old_status
             && let Err(e) = self.event_tx.send(ContainerEvent::StatusChanged {
@@ -972,7 +977,7 @@ impl ContainerOps for YoukiManager {
             exit_code: r.exit_code,
             started_at: r
                 .started_at
-                .or_else(|| r.info.created_at.map(|d| d.to_rfc3339())),
+                .or_else(|| r.info.created_at.map(|d| d.to_string())),
             finished_at: r.finished_at,
             error: r.error,
         })
@@ -2000,9 +2005,13 @@ mod tests {
             .inspect("inspect-1")
             .await
             .context("test precondition")?;
+        let started_at = detail
+            .started_at
+            .as_deref()
+            .expect("started_at should be populated");
         assert!(
-            detail.started_at.is_some(),
-            "started_at should be populated"
+            started_at.ends_with('Z'),
+            "started_at should be RFC 3339 in UTC with a Z suffix, got {started_at}"
         );
         assert!(
             detail.finished_at.is_none(),

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::collections::HashMap;
 
 use bollard::service::{Mount, MountType, PortBinding};
@@ -176,11 +176,10 @@ impl ContainerManager {
             name,
             image,
             status,
-            created_at: inspect.created.as_ref().and_then(|c| {
-                DateTime::parse_from_rfc3339(c)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .ok()
-            }),
+            created_at: inspect
+                .created
+                .as_ref()
+                .and_then(|c| c.parse::<Timestamp>().ok()),
             ports: Vec::new(),
             env,
             volumes: mounts,

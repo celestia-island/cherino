@@ -516,7 +516,7 @@ impl ContainerOps for CliContainerBackend {
                     name: params.name.clone(),
                     image: params.image.clone(),
                     status: ContainerStatus::Created,
-                    created_at: chrono::Utc::now().into(),
+                    created_at: Some(jiff::Timestamp::now()),
                     ports: params.ports.clone(),
                     env: params.env.clone(),
                     volumes: params.volumes.clone(),
@@ -1209,8 +1209,7 @@ fn extract_container_info(val: &serde_json::Value) -> Option<ContainerInfo> {
     };
 
     let created_at = json_str(obj, &["created_at", "Created", "created", "CreatedAt"])
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok());
 
     // Parse labels from JSON if present (Docker: "Labels", Apple: "labels")
     let labels = obj
@@ -1307,8 +1306,7 @@ fn extract_container_detail(val: &serde_json::Value, id_hint: &str) -> Option<Co
         .map(|s| s.to_string());
 
     let created_at = json_str(obj, &["created_at", "Created", "created", "CreatedAt"])
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc));
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok());
 
     // Parse labels from JSON if present (same logic as extract_container_info)
     let labels: HashMap<String, String> = obj
